@@ -1,0 +1,8 @@
+{
+  "env": "mock_osworld",
+  "task_id": "search_report",
+  "vlm_backend": "rule",
+  "memory_path": "runs/memory.json",
+  "max_steps": 10,
+  "retrieve_k": 4
+}

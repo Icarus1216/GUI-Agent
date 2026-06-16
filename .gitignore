@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.runtime_deps/
+.vmware_vms
+vmware_vm_data/
+runs/
+.env
+*.env
+!*.env.example
+.DS_Store

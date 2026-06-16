@@ -1,0 +1,6 @@
+{
+  "task_id": "search_report",
+  "benchmark": "mock_osworld",
+  "instruction": "Find the quarterly sales report and finish when it is open.",
+  "expected_success": "Quarterly Sales Report.pdf is open and agent emits done."
+}

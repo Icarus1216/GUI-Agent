@@ -1,0 +1,37 @@
+# 功能: 定义 Python 包构建、可选依赖分组和命令行脚本入口。
+# 上游依赖: 依赖 setuptools 构建后端和 src-layout 包结构。
+# 下游依赖: pip/install、开发环境和 `vlm-memory-agent` console script 通过该文件识别项目元数据。
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vlm-memory-agent"
+version = "0.1.0"
+description = "Research scaffold for memory-augmented VLM GUI agents on OSWorld-like benchmarks."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+qwen36-local = [
+    "accelerate",
+    "pillow",
+    "qwen-vl-utils",
+    "transformers>=4.57.0,<5",
+]
+osworld-runner = [
+    "desktop-env==1.0.2",
+    "pillow",
+    "pyautogui",
+    "pyperclip",
+]
+serve = [
+    "vllm>=0.8.5",
+]
+
+[project.scripts]
+vlm-memory-agent = "vlm_memory_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

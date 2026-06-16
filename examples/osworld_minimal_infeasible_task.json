@@ -1,0 +1,11 @@
+{
+  "id": "minimal_infeasible_probe",
+  "instruction": "This is a minimal OSWorld smoke task used only to verify that the DesktopEnv provider can start and return an observation. Mark it as failed if no real desktop is available.",
+  "config": [],
+  "evaluator": {
+    "func": "infeasible",
+    "result": {},
+    "expected": {},
+    "options": {}
+  }
+}
