@@ -393,6 +393,9 @@ not need changes.
 Each trajectory records:
 
 - task,
+- per-step action-before/action/action-after interleaved GUI state,
+- before and after screenshot paths when the environment provides screenshots,
+- structured step verification: status, reward, feedback, and environment metadata,
 - observation summary,
 - action,
 - model thought,
@@ -411,6 +414,15 @@ Memory consolidation creates:
 - L1 state-action pattern nodes,
 - L2 strategy nodes,
 - abstraction/evidence edges.
+
+L0 `trajectory` nodes keep two views of the same episode. The top-level
+`summary`, `preconditions`, `action_hints`, `expected_effects`, and
+`failure_modes` fields are compact retrieval/prompt features. The node metadata
+keeps the raw interleaved multimodal evidence under
+`trajectory_schema=interleaved_multimodal_v1` and `interleaved_steps`, where
+each step contains `before`, `action`, `after`, and `verification` blocks.
+`verification.verdict` is `progress`, `correct`, or `wrong`, so non-terminal
+useful progress is not conflated with a failed action.
 
 `image-evidence` nodes store the screenshot path, trajectory node id, step
 index, before/after phase, action, status, reward, and feedback in node

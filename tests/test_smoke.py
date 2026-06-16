@@ -80,6 +80,14 @@ class SmokeTest(unittest.TestCase):
             trajectory_nodes = [node for node in nodes if node.kind == "trajectory"]
             self.assertEqual(len(trajectory_nodes), 1)
             leaf = trajectory_nodes[0]
+            self.assertEqual(leaf.metadata["trajectory_schema"], "interleaved_multimodal_v1")
+            self.assertEqual(leaf.metadata["step_count"], len(trajectory.steps))
+            first_step = leaf.metadata["interleaved_steps"][0]
+            self.assertIn("screenshot_path", first_step["before"])
+            self.assertIn("action_type", first_step["action"])
+            self.assertIn("screenshot_path", first_step["after"])
+            self.assertIn("feedback", first_step["verification"])
+            self.assertIn(first_step["verification"]["verdict"], {"progress", "correct", "wrong"})
             self.assertTrue(any(eid.startswith("image:") for eid in leaf.evidence_ids))
             self.assertTrue(any(dst.startswith("image:") for dst in memory.edges[leaf.node_id]))
 

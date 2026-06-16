@@ -32,6 +32,18 @@ def jaccard(a: set[str], b: set[str]) -> float:
     return len(a & b) / len(a | b)
 
 
+def _json_safe_value(value: Any) -> Any:
+    """把环境 metadata 中的第三方对象转成 JSON-safe 值。"""
+
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
 @dataclass(slots=True)
 class MemoryNode:
     """层次记忆图里的一个节点。
@@ -211,7 +223,12 @@ class HierarchicalMemoryStore:
         self.edges = {src: set(dst) for src, dst in payload.get("edges", {}).items()}
 
     def _trajectory_leaf(self, trajectory: Trajectory) -> MemoryNode:
-        """把原始 trajectory 压缩成 L0 evidence node。"""
+        """把原始 trajectory 压缩成 L0 evidence node。
+
+        summary/action_hints 是给检索和 prompt 使用的抽象视图；metadata 中的
+        `interleaved_steps` 保留逐步交错模态原始证据：动作前 GUI 状态、
+        action、动作后 GUI 状态，以及环境/evaluator 对这一步的 verify。
+        """
 
         status = "success" if trajectory.success else "failure"
         action_trace = " -> ".join(step.action.compact() for step in trajectory.steps)
@@ -229,8 +246,48 @@ class HierarchicalMemoryStore:
             confidence=0.7 if trajectory.success else 0.45,
             success_count=1 if trajectory.success else 0,
             tags=list(tokenize(trajectory.task))[:8],
+            metadata={
+                "trajectory_schema": "interleaved_multimodal_v1",
+                "task_id": trajectory.task_id,
+                "task": trajectory.task,
+                "success": trajectory.success,
+                "step_count": len(trajectory.steps),
+                "interleaved_steps": [
+                    self._interleaved_step_payload(index, step) for index, step in enumerate(trajectory.steps)
+                ],
+            },
         )
         return node
+
+    def _interleaved_step_payload(self, index: int, step: Any) -> dict[str, Any]:
+        """保留单步交错模态 trajectory 原始证据。
+
+        `verification.verdict` 区分 progress/correct/wrong：RUNNING step
+        代表动作未被判错但仍需继续，SUCCESS/FAILED 才分别写成明确正确或
+        错误，具体原因保存在 feedback/metadata 中。
+        """
+
+        verdict = "correct" if step.status == StepStatus.SUCCESS else "wrong" if step.status == StepStatus.FAILED else "progress"
+        return {
+            "step_index": index,
+            "before": self._observation_evidence(step.observation),
+            "action": step.action.to_dict(),
+            "after": self._observation_evidence(step.next_observation) if step.next_observation else None,
+            "verification": {
+                "status": step.status.value,
+                "verdict": verdict,
+                "correct": True if step.status == StepStatus.SUCCESS else False if step.status == StepStatus.FAILED else None,
+                "failed": step.status == StepStatus.FAILED,
+                "reward": step.reward,
+                "feedback": step.feedback,
+                "metadata": _json_safe_value(step.metadata),
+            },
+        }
+
+    def _observation_evidence(self, observation: Any) -> dict[str, Any]:
+        """把 observation 转成适合嵌入 trajectory node 的 GUI 状态证据。"""
+
+        return observation.to_dict()
 
     def _image_evidence_nodes(self, trajectory: Trajectory, leaf_id: str) -> list[MemoryNode]:
         """从 trajectory 中抽取关键截图并生成 image-evidence 节点。
