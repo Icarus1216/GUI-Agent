@@ -60,6 +60,37 @@ class SmokeTest(unittest.TestCase):
             self.assertTrue(Path(screenshot_path).exists())
             self.assertIn("crm_saved", payload["steps"][-1]["next_observation_detail"]["metadata"])
 
+    def test_memory_adds_traceable_image_evidence_nodes(self):
+        with TemporaryDirectory() as tmp:
+            memory_path = Path(tmp) / "memory.json"
+            env = LocalBrowserSalesEnv(screenshot_dir=Path(tmp) / "screens")
+            trajectory = VLMGuiAgent(RuleBasedVLMClient(), HierarchicalMemoryStore(), config=None).run_episode(
+                env, task_id="sales_approval"
+            )
+
+            memory = HierarchicalMemoryStore(memory_path)
+            nodes = memory.update_from_trajectory(trajectory)
+            image_nodes = [node for node in nodes if node.kind == "image-evidence"]
+            self.assertTrue(image_nodes)
+            self.assertLessEqual(len(image_nodes), memory.max_image_evidence_per_trajectory)
+            self.assertTrue(Path(str(image_nodes[0].metadata["image_path"])).exists())
+            self.assertIn("step_index", image_nodes[0].metadata)
+
+            trajectory_nodes = [node for node in nodes if node.kind == "trajectory"]
+            self.assertEqual(len(trajectory_nodes), 1)
+            leaf = trajectory_nodes[0]
+            self.assertTrue(any(eid.startswith("image:") for eid in leaf.evidence_ids))
+            self.assertTrue(any(dst.startswith("image:") for dst in memory.edges[leaf.node_id]))
+
+            context = memory.prompt_context([image_nodes[0]])
+            self.assertIn("Image path:", context)
+            self.assertIn(str(image_nodes[0].metadata["image_path"]), context)
+
+            reloaded = HierarchicalMemoryStore(memory_path)
+            reloaded_images = [node for node in reloaded.nodes.values() if node.kind == "image-evidence"]
+            self.assertEqual(len(reloaded_images), len(image_nodes))
+            self.assertIn("image_path", reloaded_images[0].metadata)
+
     def test_agent_turns_invalid_vlm_json_into_fail_action(self):
         class BadJsonVLM(VLMClient):
             def decide(self, prompt, image_path=None):

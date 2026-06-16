@@ -406,9 +406,16 @@ Each trajectory records:
 Memory consolidation creates:
 
 - L0 trajectory nodes,
+- L0 image-evidence nodes for key screenshots,
 - L1 state-action pattern nodes,
 - L2 strategy nodes,
 - abstraction/evidence edges.
+
+`image-evidence` nodes store the screenshot path, trajectory node id, step
+index, before/after phase, action, status, reward, and feedback in node
+metadata. They are linked from the trajectory and pattern nodes, so a retrieved
+memory can be traced back to the exact visual state that supported it without
+embedding raw image bytes into the memory JSON.
 
 This is enough to run controlled studies on cross-episode experience transfer:
 

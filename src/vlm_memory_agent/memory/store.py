@@ -1,4 +1,4 @@
-"""功能: 实现层次化经验记忆图的保存、加载、检索和从 trajectory 自动固化经验。
+"""功能: 实现层次化经验记忆图、多模态图像证据节点的保存、加载、检索和从 trajectory 自动固化经验。
 上游依赖: 依赖 core Trajectory/StepStatus、JSON 文件路径和简单 token/Jaccard 相似度。
 下游依赖: VLMGuiAgent、API server、BenchmarkRunner、CLI 和测试用它提供长期记忆上下文。
 """
@@ -37,9 +37,11 @@ class MemoryNode:
     """层次记忆图里的一个节点。
 
     level=0 表示具体 trajectory，level=1 表示从相似任务中归纳出的
-    state-action pattern，level=2 表示更抽象的通用策略。字段按 prompt
-    需要组织：preconditions/action_hints/effects/failure_modes 会直接
-    进入 VLM 上下文。
+    state-action pattern，level=2 表示更抽象的通用策略。`kind=image-evidence`
+    的节点也是 level=0，但它指向某一步关键截图，作为 trajectory/pattern
+    的可追溯多模态证据。字段按 prompt 需要组织：preconditions/action_hints/
+    effects/failure_modes 会直接进入 VLM 上下文；metadata 保存截图路径、
+    step index、before/after phase、reward 等结构化证据。
     """
 
     node_id: str
@@ -55,6 +57,7 @@ class MemoryNode:
     success_count: int = 0
     use_count: int = 0
     tags: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def text_for_retrieval(self) -> str:
         """拼接用于检索的文本视图。
@@ -71,20 +74,24 @@ class MemoryNode:
             " ".join(self.expected_effects),
             " ".join(self.failure_modes),
             " ".join(self.tags),
+            " ".join(str(value) for key, value in self.metadata.items() if key in {"image_path", "phase", "action_type", "status"}),
         ]
         return " ".join(parts)
 
 
 class HierarchicalMemoryStore:
-    """Small hierarchical experience memory graph.
+    """Small hierarchical multimodal experience memory graph.
 
     L0 nodes are concrete trajectories. L1 nodes are reusable state-action
-    patterns. L2 nodes are higher-level strategies. The consolidation is
+    patterns. L2 nodes are higher-level strategies. In addition, L0
+    `image-evidence` nodes preserve key screenshots as traceable multimodal
+    evidence linked from trajectories and patterns. The consolidation is
     deliberately simple and inspectable so methods can replace it later.
     """
 
-    def __init__(self, path: str | Path | None = None):
+    def __init__(self, path: str | Path | None = None, max_image_evidence_per_trajectory: int = 6):
         self.path = Path(path) if path else None
+        self.max_image_evidence_per_trajectory = max_image_evidence_per_trajectory
         self.nodes: dict[str, MemoryNode] = {}
         self.edges: dict[str, set[str]] = {}
         if self.path and self.path.exists():
@@ -121,14 +128,21 @@ class HierarchicalMemoryStore:
         """
 
         leaf = self._trajectory_leaf(trajectory)
+        image_nodes = self._image_evidence_nodes(trajectory, leaf.node_id)
+        leaf.evidence_ids.extend(node.node_id for node in image_nodes)
         self.nodes[leaf.node_id] = leaf
+        for image_node in image_nodes:
+            self.nodes[image_node.node_id] = image_node
+            self._link(leaf.node_id, image_node.node_id)
         pattern = self._consolidate_pattern(leaf)
         strategy = self._consolidate_strategy(pattern)
         self._link(pattern.node_id, leaf.node_id)
+        for image_node in image_nodes:
+            self._link(pattern.node_id, image_node.node_id)
         self._link(strategy.node_id, pattern.node_id)
         if self.path:
             self.save(self.path)
-        return [leaf, pattern, strategy]
+        return [leaf, *image_nodes, pattern, strategy]
 
     def prompt_context(self, nodes: list[MemoryNode]) -> str:
         """把检索到的节点格式化为 prompt 上下文。
@@ -142,6 +156,9 @@ class HierarchicalMemoryStore:
             return "No relevant long-term memory."
         blocks = []
         for node in nodes:
+            if node.kind == "image-evidence":
+                blocks.append(self._image_prompt_block(node))
+                continue
             blocks.append(
                 "\n".join(
                     [
@@ -171,7 +188,7 @@ class HierarchicalMemoryStore:
 
     def load(self, path: str | Path) -> None:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        self.nodes = {item["node_id"]: MemoryNode(**item) for item in payload.get("nodes", [])}
+        self.nodes = {item["node_id"]: MemoryNode(**self._memory_node_payload(item)) for item in payload.get("nodes", [])}
         self.edges = {src: set(dst) for src, dst in payload.get("edges", {}).items()}
 
     def _trajectory_leaf(self, trajectory: Trajectory) -> MemoryNode:
@@ -195,6 +212,73 @@ class HierarchicalMemoryStore:
             tags=list(tokenize(trajectory.task))[:8],
         )
         return node
+
+    def _image_evidence_nodes(self, trajectory: Trajectory, leaf_id: str) -> list[MemoryNode]:
+        """从 trajectory 中抽取关键截图并生成 image-evidence 节点。
+
+        选择策略保持保守和可解释：
+        - 首帧 before screenshot，记录任务起始状态；
+        - 每个非 wait 动作后的 after screenshot，记录动作效果；
+        - 任何成功/失败终态 after screenshot，记录 evaluator 结论对应画面。
+
+        通过 screenshot_path 去重，并限制每条 trajectory 的图像证据数量，
+        避免长程任务把 memory JSON 膨胀成逐帧日志。
+        """
+
+        candidates: list[tuple[int, str, str, Any]] = []
+        for index, step in enumerate(trajectory.steps):
+            if index == 0 and step.observation.screenshot_path:
+                candidates.append((index, "before", step.observation.screenshot_path, step))
+            if step.next_observation and step.next_observation.screenshot_path:
+                is_terminal = step.status != StepStatus.RUNNING
+                is_action_effect = step.action.action_type != "wait"
+                if is_action_effect or is_terminal:
+                    candidates.append((index, "after", step.next_observation.screenshot_path, step))
+
+        nodes: list[MemoryNode] = []
+        seen_paths: set[str] = set()
+        for index, phase, screenshot_path, step in candidates:
+            if screenshot_path in seen_paths:
+                continue
+            seen_paths.add(screenshot_path)
+            if len(nodes) >= self.max_image_evidence_per_trajectory:
+                break
+            status = step.status.value
+            action = step.action.compact()
+            screen_text = step.next_observation.screen_text if phase == "after" and step.next_observation else step.observation.screen_text
+            node_id = f"image:{trajectory.task_id}:{len(self.nodes)}:{len(nodes)}"
+            nodes.append(
+                MemoryNode(
+                    node_id=node_id,
+                    level=0,
+                    kind="image-evidence",
+                    summary=(
+                        f"Image evidence for trajectory {leaf_id}, step {index} {phase}. "
+                        f"Action: {action}. Status: {status}. Screenshot: {screenshot_path}"
+                    ),
+                    evidence_ids=[leaf_id],
+                    preconditions=[self._trim(screen_text, 1200)] if screen_text else [],
+                    action_hints=[action],
+                    expected_effects=[step.feedback] if step.status == StepStatus.SUCCESS and step.feedback else [],
+                    failure_modes=[step.feedback] if step.status == StepStatus.FAILED and step.feedback else [],
+                    confidence=0.72 if step.status == StepStatus.SUCCESS else 0.55,
+                    success_count=1 if step.status == StepStatus.SUCCESS else 0,
+                    tags=self._dedupe([*list(tokenize(trajectory.task))[:8], "image", "screenshot", phase, step.action.action_type, status]),
+                    metadata={
+                        "image_path": screenshot_path,
+                        "trajectory_node_id": leaf_id,
+                        "task_id": trajectory.task_id,
+                        "step_index": index,
+                        "phase": phase,
+                        "action": action,
+                        "action_type": step.action.action_type,
+                        "status": status,
+                        "reward": step.reward,
+                        "feedback": step.feedback,
+                    },
+                )
+            )
+        return nodes
 
     def _consolidate_pattern(self, leaf: MemoryNode) -> MemoryNode:
         """把 L0 trajectory 合并到相似的 L1 pattern，或创建新 pattern。
@@ -265,6 +349,29 @@ class HierarchicalMemoryStore:
 
     def _link(self, src: str, dst: str) -> None:
         self.edges.setdefault(src, set()).add(dst)
+
+    def _image_prompt_block(self, node: MemoryNode) -> str:
+        """把图像证据节点格式化为 prompt 可读的可追溯引用。"""
+
+        image_path = node.metadata.get("image_path", "unknown")
+        return "\n".join(
+            [
+                f"[{node.kind}:{node.node_id} confidence={node.confidence:.2f}]",
+                f"Summary: {node.summary}",
+                f"Image path: {image_path}",
+                f"Step: {node.metadata.get('step_index', 'n/a')} phase={node.metadata.get('phase', 'n/a')} status={node.metadata.get('status', 'n/a')}",
+                f"Action: {node.metadata.get('action', ', '.join(node.action_hints) or 'n/a')}",
+                f"Screen evidence: {', '.join(node.preconditions) or 'n/a'}",
+                f"Feedback: {node.metadata.get('feedback') or 'n/a'}",
+            ]
+        )
+
+    def _memory_node_payload(self, item: dict[str, Any]) -> dict[str, Any]:
+        """加载旧版 memory JSON 时补齐新增字段。"""
+
+        payload = dict(item)
+        payload.setdefault("metadata", {})
+        return payload
 
     def _dedupe(self, values: list[str]) -> list[str]:
         seen = set()
