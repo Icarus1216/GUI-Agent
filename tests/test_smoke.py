@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from vlm_memory_agent.cli import main as cli_main
-from vlm_memory_agent.core.types import AgentAction, Observation, StepStatus, UIElement
+from vlm_memory_agent.core.types import AgentAction, Observation, StepStatus, Trajectory, UIElement
 from vlm_memory_agent.agent import VLMGuiAgent
 from vlm_memory_agent.envs.osworld_adapter import OSWorldAdapter
 from vlm_memory_agent.envs.osworld_runner import OSWorldEnvConfig, _construct_with_supported_kwargs, _desktop_env_failure_hint, iter_task_config_paths, load_task_config
@@ -90,6 +90,32 @@ class SmokeTest(unittest.TestCase):
             reloaded_images = [node for node in reloaded.nodes.values() if node.kind == "image-evidence"]
             self.assertEqual(len(reloaded_images), len(image_nodes))
             self.assertIn("image_path", reloaded_images[0].metadata)
+
+    def test_memory_reflects_failed_trajectory_with_evidence(self):
+        with TemporaryDirectory() as tmp:
+            env = LocalBrowserSalesEnv(screenshot_dir=Path(tmp) / "screens")
+            initial = env.reset("sales_approval")
+            failed = env.step(AgentAction("done", thought="incorrectly assume done"))
+            failed.status = StepStatus.FAILED
+            failed.feedback = "Cannot finish before the approval is submitted."
+            trajectory = Trajectory(task_id="sales_failure", task=initial.task)
+            trajectory.append(failed)
+
+            memory = HierarchicalMemoryStore(Path(tmp) / "memory.json")
+            nodes = memory.update_from_trajectory(trajectory)
+            reflections = [node for node in nodes if node.kind == "failure-reflection"]
+            self.assertEqual(len(reflections), 1)
+            reflection = reflections[0]
+            self.assertIn("done", reflection.metadata["bad_action"])
+            self.assertIn("Do not call done", reflection.metadata["recovery_hint"])
+            self.assertTrue(reflection.metadata["image_evidence_ids"])
+            self.assertTrue(any(dst.startswith("image:") for dst in memory.edges[reflection.node_id]))
+
+            retrieved = memory.retrieve("finish approval submitted visible done", k=5)
+            self.assertTrue(any(node.kind == "failure-reflection" for node in retrieved))
+            context = memory.prompt_context([reflection])
+            self.assertIn("Bad action:", context)
+            self.assertIn("Recovery hint:", context)
 
     def test_agent_turns_invalid_vlm_json_into_fail_action(self):
         class BadJsonVLM(VLMClient):

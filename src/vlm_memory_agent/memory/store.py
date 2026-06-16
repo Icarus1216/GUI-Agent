@@ -41,7 +41,8 @@ class MemoryNode:
     的节点也是 level=0，但它指向某一步关键截图，作为 trajectory/pattern
     的可追溯多模态证据。字段按 prompt 需要组织：preconditions/action_hints/
     effects/failure_modes 会直接进入 VLM 上下文；metadata 保存截图路径、
-    step index、before/after phase、reward 等结构化证据。
+    step index、before/after phase、reward 等结构化证据。`kind=failure-reflection`
+    的节点把错误历史轨迹反思成 avoid/recover 经验，并链接到对应截图证据。
     """
 
     node_id: str
@@ -74,7 +75,11 @@ class MemoryNode:
             " ".join(self.expected_effects),
             " ".join(self.failure_modes),
             " ".join(self.tags),
-            " ".join(str(value) for key, value in self.metadata.items() if key in {"image_path", "phase", "action_type", "status"}),
+            " ".join(
+                str(value)
+                for key, value in self.metadata.items()
+                if key in {"image_path", "phase", "action_type", "status", "bad_action", "avoid_when", "recovery_hint"}
+            ),
         ]
         return " ".join(parts)
 
@@ -85,7 +90,8 @@ class HierarchicalMemoryStore:
     L0 nodes are concrete trajectories. L1 nodes are reusable state-action
     patterns. L2 nodes are higher-level strategies. In addition, L0
     `image-evidence` nodes preserve key screenshots as traceable multimodal
-    evidence linked from trajectories and patterns. The consolidation is
+    evidence linked from trajectories and patterns. `failure-reflection` nodes
+    turn failed histories into explicit avoid/recover experience. The consolidation is
     deliberately simple and inspectable so methods can replace it later.
     """
 
@@ -134,15 +140,25 @@ class HierarchicalMemoryStore:
         for image_node in image_nodes:
             self.nodes[image_node.node_id] = image_node
             self._link(leaf.node_id, image_node.node_id)
+        reflection = self._failure_reflection_node(trajectory, leaf, image_nodes)
+        if reflection is not None:
+            leaf.evidence_ids.append(reflection.node_id)
+            self.nodes[reflection.node_id] = reflection
+            self._link(leaf.node_id, reflection.node_id)
+            for evidence_id in reflection.evidence_ids:
+                if evidence_id.startswith("image:"):
+                    self._link(reflection.node_id, evidence_id)
         pattern = self._consolidate_pattern(leaf)
         strategy = self._consolidate_strategy(pattern)
         self._link(pattern.node_id, leaf.node_id)
         for image_node in image_nodes:
             self._link(pattern.node_id, image_node.node_id)
+        if reflection is not None:
+            self._link(pattern.node_id, reflection.node_id)
         self._link(strategy.node_id, pattern.node_id)
         if self.path:
             self.save(self.path)
-        return [leaf, *image_nodes, pattern, strategy]
+        return [leaf, *image_nodes, *([reflection] if reflection is not None else []), pattern, strategy]
 
     def prompt_context(self, nodes: list[MemoryNode]) -> str:
         """把检索到的节点格式化为 prompt 上下文。
@@ -158,6 +174,9 @@ class HierarchicalMemoryStore:
         for node in nodes:
             if node.kind == "image-evidence":
                 blocks.append(self._image_prompt_block(node))
+                continue
+            if node.kind == "failure-reflection":
+                blocks.append(self._failure_prompt_block(node))
                 continue
             blocks.append(
                 "\n".join(
@@ -280,6 +299,79 @@ class HierarchicalMemoryStore:
             )
         return nodes
 
+    def _failure_reflection_node(
+        self,
+        trajectory: Trajectory,
+        leaf: MemoryNode,
+        image_nodes: list[MemoryNode],
+    ) -> MemoryNode | None:
+        """把失败历史轨迹反思成可复用的 avoid/recover 经验。
+
+        失败 memory 的关键不是“这条轨迹失败了”，而是保留：
+        - 失败发生前的屏幕状态；
+        - 具体错误/无效动作；
+        - 环境反馈；
+        - 下一次遇到相似状态时应避免什么、尝试什么恢复动作；
+        - 能追溯到的截图证据。
+        """
+
+        failure_steps = [index for index, step in enumerate(trajectory.steps) if step.status == StepStatus.FAILED]
+        if not failure_steps and trajectory.success:
+            return None
+        focus_index = failure_steps[-1] if failure_steps else max(0, len(trajectory.steps) - 1)
+        if not trajectory.steps:
+            return None
+        step = trajectory.steps[focus_index]
+        before_text = self._trim(step.observation.screen_text, 1400)
+        after_text = self._trim(step.next_observation.screen_text, 1400) if step.next_observation else ""
+        bad_action = step.action.compact()
+        feedback = step.feedback or "No explicit environment feedback."
+        avoid_when = self._reflection_avoid_when(step)
+        recovery_hint = self._reflection_recovery_hint(step, trajectory)
+        related_images = self._related_image_ids(image_nodes, focus_index)
+        evidence_ids = self._dedupe([leaf.node_id, *related_images])
+        tags = self._dedupe(
+            [
+                *list(tokenize(trajectory.task))[:8],
+                "failure",
+                "reflection",
+                step.action.action_type,
+                step.status.value,
+                *list(tokenize(feedback))[:6],
+            ]
+        )
+        return MemoryNode(
+            node_id=f"reflection:{trajectory.task_id}:{len(self.nodes)}",
+            level=1,
+            kind="failure-reflection",
+            summary=(
+                f"Failure reflection for task `{trajectory.task}`. In a state like `{avoid_when}`, "
+                f"the action `{bad_action}` led to failure/poor progress: {feedback}"
+            ),
+            evidence_ids=evidence_ids,
+            preconditions=[before_text] if before_text else [],
+            action_hints=[recovery_hint],
+            expected_effects=[],
+            failure_modes=[f"Avoid `{bad_action}` when {avoid_when}. Feedback: {feedback}"],
+            confidence=0.68,
+            success_count=0,
+            tags=tags,
+            metadata={
+                "trajectory_node_id": leaf.node_id,
+                "task_id": trajectory.task_id,
+                "failed_step_index": focus_index,
+                "bad_action": bad_action,
+                "bad_action_type": step.action.action_type,
+                "avoid_when": avoid_when,
+                "recovery_hint": recovery_hint,
+                "feedback": feedback,
+                "before_screen_text": before_text,
+                "after_screen_text": after_text,
+                "image_evidence_ids": related_images,
+                "terminal_failure": step.status == StepStatus.FAILED,
+            },
+        )
+
     def _consolidate_pattern(self, leaf: MemoryNode) -> MemoryNode:
         """把 L0 trajectory 合并到相似的 L1 pattern，或创建新 pattern。
 
@@ -291,7 +383,7 @@ class HierarchicalMemoryStore:
         existing = [
             node
             for node in self.nodes.values()
-            if node.level == 1 and jaccard(tags, set(node.tags)) >= 0.35
+            if node.kind == "state-action-pattern" and node.level == 1 and jaccard(tags, set(node.tags)) >= 0.35
         ]
         if existing:
             node = existing[0]
@@ -365,6 +457,62 @@ class HierarchicalMemoryStore:
                 f"Feedback: {node.metadata.get('feedback') or 'n/a'}",
             ]
         )
+
+    def _failure_prompt_block(self, node: MemoryNode) -> str:
+        """把失败反思节点格式化为 prompt 中的显式避错经验。"""
+
+        return "\n".join(
+            [
+                f"[{node.kind}:{node.node_id} confidence={node.confidence:.2f}]",
+                f"Summary: {node.summary}",
+                f"Avoid when: {node.metadata.get('avoid_when') or 'n/a'}",
+                f"Bad action: {node.metadata.get('bad_action') or 'n/a'}",
+                f"Failure mode: {', '.join(node.failure_modes) or 'n/a'}",
+                f"Recovery hint: {node.metadata.get('recovery_hint') or ', '.join(node.action_hints) or 'n/a'}",
+                f"Evidence ids: {', '.join(node.evidence_ids) or 'n/a'}",
+            ]
+        )
+
+    def _reflection_avoid_when(self, step: Any) -> str:
+        """生成失败状态的短描述，用于 prompt 中判断适用条件。"""
+
+        elements = ", ".join(element.element_id for element in step.observation.ui_elements[:8])
+        screen = self._trim(step.observation.screen_text, 240).replace("\n", " ")
+        if elements:
+            return f"visible elements include [{elements}] and screen says `{screen}`"
+        return f"screen says `{screen}`"
+
+    def _reflection_recovery_hint(self, step: Any, trajectory: Trajectory) -> str:
+        """根据失败动作和轨迹上下文生成保守恢复建议。
+
+        当前不调用 LLM 做反思，避免引入额外不确定性；先用规则生成可解释的
+        recovery hint，后续可以替换成离线反思模型。
+        """
+
+        if step.action.action_type == "done":
+            return "Do not call done until the goal state is visibly achieved or evaluator evidence is present."
+        if step.action.action_type == "fail":
+            return "Before failing, inspect visible UI, wait once if the screen may still update, or try a reversible navigation/search action."
+        if step.action.action_type in {"click", "double_click", "right_click"}:
+            return "Verify the target is visible and clickable; if there is no state change, use a more specific element or coordinate from the screenshot."
+        if step.action.action_type in {"type", "paste"}:
+            return "Verify the intended text field is focused and visible before entering text; clear or select the field if stale text remains."
+        if step.action.action_type in {"hotkey", "press"}:
+            return "Use keyboard actions only when focus is known; otherwise click the target control first."
+        if step.action.action_type == "scroll":
+            return "Scroll only when the needed element is off-screen; re-check the visible state after scrolling."
+        previous_actions = " -> ".join(item.action.compact() for item in trajectory.steps[max(0, len(trajectory.steps) - 3) :])
+        return f"Backtrack from the recent action sequence and choose a different visible UI target. Recent actions: {previous_actions}"
+
+    def _related_image_ids(self, image_nodes: list[MemoryNode], focus_index: int) -> list[str]:
+        """选择最接近失败 step 的图像证据节点 id。"""
+
+        scored = []
+        for node in image_nodes:
+            step_index = node.metadata.get("step_index")
+            if isinstance(step_index, int):
+                scored.append((abs(step_index - focus_index), node.node_id))
+        return [node_id for _, node_id in sorted(scored)[:2]]
 
     def _memory_node_payload(self, item: dict[str, Any]) -> dict[str, Any]:
         """加载旧版 memory JSON 时补齐新增字段。"""

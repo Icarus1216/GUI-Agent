@@ -407,6 +407,7 @@ Memory consolidation creates:
 
 - L0 trajectory nodes,
 - L0 image-evidence nodes for key screenshots,
+- L1 failure-reflection nodes for failed histories,
 - L1 state-action pattern nodes,
 - L2 strategy nodes,
 - abstraction/evidence edges.
@@ -416,6 +417,12 @@ index, before/after phase, action, status, reward, and feedback in node
 metadata. They are linked from the trajectory and pattern nodes, so a retrieved
 memory can be traced back to the exact visual state that supported it without
 embedding raw image bytes into the memory JSON.
+
+`failure-reflection` nodes are created from failed trajectories or failed steps.
+They preserve the bad action, triggering screen state, environment feedback,
+avoid condition, recovery hint, and linked image evidence ids. This makes
+negative experience first-class memory: future episodes can retrieve not only
+what worked, but also what failed and the visual evidence behind that reflection.
 
 This is enough to run controlled studies on cross-episode experience transfer:
 
