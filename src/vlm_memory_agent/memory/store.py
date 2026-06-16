@@ -93,7 +93,22 @@ class MemoryNode:
             " ".join(
                 str(value)
                 for key, value in self.metadata.items()
-                if key in {"image_path", "phase", "action_type", "status", "bad_action", "avoid_when", "recovery_hint"}
+                if key
+                in {
+                    "image_path",
+                    "phase",
+                    "action_type",
+                    "status",
+                    "bad_action",
+                    "avoid_when",
+                    "recovery_hint",
+                    "error_type",
+                    "root_cause",
+                    "diagnostic_check",
+                    "recovery_policy",
+                    "skill_name",
+                    "applies_when",
+                }
             ),
         ]
         return " ".join(parts)
@@ -198,6 +213,9 @@ class HierarchicalMemoryStore:
                 continue
             if node.kind == "failure-reflection":
                 blocks.append(self._failure_prompt_block(node))
+                continue
+            if node.kind == "skill":
+                blocks.append(self._skill_prompt_block(node))
                 continue
             blocks.append(
                 "\n".join(
@@ -536,8 +554,12 @@ class HierarchicalMemoryStore:
         after_text = self._trim(step.next_observation.screen_text, 1400) if step.next_observation else ""
         bad_action = step.action.compact()
         feedback = step.feedback or "No explicit environment feedback."
+        error_type = self._classify_error_type(step, trajectory)
+        root_cause = self._reflection_root_cause(error_type, step, trajectory)
+        diagnostic_check = self._reflection_diagnostic_check(error_type, step)
         avoid_when = self._reflection_avoid_when(step)
         recovery_hint = self._reflection_recovery_hint(step, trajectory)
+        skill_id = self._skill_id_for_error(error_type, step)
         related_images = self._related_image_ids(image_nodes, focus_index)
         evidence_ids = self._dedupe([leaf.node_id, *related_images])
         tags = self._dedupe(
@@ -545,6 +567,7 @@ class HierarchicalMemoryStore:
                 *list(tokenize(trajectory.task))[:8],
                 "failure",
                 "reflection",
+                error_type,
                 step.action.action_type,
                 step.status.value,
                 *list(tokenize(feedback))[:6],
@@ -555,14 +578,15 @@ class HierarchicalMemoryStore:
             level=1,
             kind="failure-reflection",
             summary=(
-                f"Failure reflection for task `{trajectory.task}`. In a state like `{avoid_when}`, "
+                f"{error_type} error reflection for task `{trajectory.task}`. "
+                f"Root cause: {root_cause}. In a state like `{avoid_when}`, "
                 f"the action `{bad_action}` led to failure/poor progress: {feedback}"
             ),
             evidence_ids=evidence_ids,
             preconditions=[before_text] if before_text else [],
             action_hints=[recovery_hint],
             expected_effects=[],
-            failure_modes=[f"Avoid `{bad_action}` when {avoid_when}. Feedback: {feedback}"],
+            failure_modes=[f"{error_type} error: {root_cause}. Avoid `{bad_action}` when {avoid_when}. Feedback: {feedback}"],
             confidence=0.68,
             success_count=0,
             tags=tags,
@@ -570,10 +594,15 @@ class HierarchicalMemoryStore:
                 "trajectory_node_id": leaf.node_id,
                 "task_id": trajectory.task_id,
                 "failed_step_index": focus_index,
+                "error_type": error_type,
+                "root_cause": root_cause,
+                "diagnostic_check": diagnostic_check,
                 "bad_action": bad_action,
                 "bad_action_type": step.action.action_type,
                 "avoid_when": avoid_when,
                 "recovery_hint": recovery_hint,
+                "recovery_policy": recovery_hint,
+                "learned_skill_id": skill_id,
                 "feedback": feedback,
                 "before_screen_text": before_text,
                 "after_screen_text": after_text,
@@ -668,6 +697,22 @@ class HierarchicalMemoryStore:
             ]
         )
 
+    def _skill_prompt_block(self, node: MemoryNode) -> str:
+        """把 skill 节点格式化为优先可执行的 GUI 经验。"""
+
+        return "\n".join(
+            [
+                f"[{node.kind}:{node.node_id} confidence={node.confidence:.2f}]",
+                f"Skill: {node.metadata.get('skill_name') or node.summary}",
+                f"Error type handled: {node.metadata.get('error_type') or 'n/a'}",
+                f"Applies when: {node.metadata.get('applies_when') or ', '.join(node.preconditions) or 'n/a'}",
+                f"Procedure: {node.metadata.get('procedure') or ', '.join(node.action_hints) or 'n/a'}",
+                f"Check items: {', '.join(node.metadata.get('check_items', [])) or 'n/a'}",
+                f"Recovery steps: {', '.join(node.metadata.get('recovery_steps', [])) or 'n/a'}",
+                f"Source failures: {node.metadata.get('source_count', 0)}",
+            ]
+        )
+
     def _failure_prompt_block(self, node: MemoryNode) -> str:
         """把失败反思节点格式化为 prompt 中的显式避错经验。"""
 
@@ -675,13 +720,60 @@ class HierarchicalMemoryStore:
             [
                 f"[{node.kind}:{node.node_id} confidence={node.confidence:.2f}]",
                 f"Summary: {node.summary}",
+                f"Error type: {node.metadata.get('error_type') or 'n/a'}",
+                f"Root cause: {node.metadata.get('root_cause') or 'n/a'}",
                 f"Avoid when: {node.metadata.get('avoid_when') or 'n/a'}",
                 f"Bad action: {node.metadata.get('bad_action') or 'n/a'}",
                 f"Failure mode: {', '.join(node.failure_modes) or 'n/a'}",
+                f"Diagnostic check: {node.metadata.get('diagnostic_check') or 'n/a'}",
                 f"Recovery hint: {node.metadata.get('recovery_hint') or ', '.join(node.action_hints) or 'n/a'}",
+                f"Learned skill: {node.metadata.get('learned_skill_id') or 'n/a'}",
                 f"Evidence ids: {', '.join(node.evidence_ids) or 'n/a'}",
             ]
         )
+
+    def _classify_error_type(self, step: Any, trajectory: Trajectory) -> str:
+        """把失败归因到 observation/decision/execution 三类之一。"""
+
+        feedback = (step.feedback or "").lower()
+        action_type = step.action.action_type
+        before = step.observation.screen_text.lower()
+        after = step.next_observation.screen_text.lower() if step.next_observation else ""
+        if action_type == "done":
+            return "observation" if any(word in after or word in before for word in ("not submitted", "not saved", "incomplete", "empty")) else "decision"
+        if action_type == "fail":
+            return "decision"
+        if action_type in {"click", "double_click", "right_click", "type", "paste", "hotkey", "press", "scroll"}:
+            if any(word in feedback for word in ("no effect", "focus", "not focused", "miss", "invalid target", "cannot click")):
+                return "execution"
+            if self._screen_change_score(step) < 0.05 and action_type not in {"wait", "scroll"}:
+                return "execution"
+        if any(word in feedback for word in ("cannot finish", "before", "prerequisite", "required")):
+            return "decision"
+        return "decision"
+
+    def _reflection_root_cause(self, error_type: str, step: Any, trajectory: Trajectory) -> str:
+        """生成短根因描述，供后续 skill 蒸馏。"""
+
+        if error_type == "observation":
+            return "The agent misread or over-trusted the GUI state and did not verify visible completion evidence."
+        if error_type == "execution":
+            return "The intended action was not reliably grounded to the active/focused GUI target or produced no state change."
+        if step.action.action_type == "done":
+            return "The agent chose a terminal action before all task prerequisites were visibly satisfied."
+        if step.action.action_type == "fail":
+            return "The agent stopped instead of trying a reversible recovery action from the visible UI state."
+        recent_actions = " -> ".join(item.action.compact() for item in trajectory.steps[max(0, len(trajectory.steps) - 3) :])
+        return f"The policy selected an action sequence that did not satisfy the next prerequisite. Recent actions: {recent_actions}"
+
+    def _reflection_diagnostic_check(self, error_type: str, step: Any) -> str:
+        """给未来 agent 的可执行诊断检查。"""
+
+        if error_type == "observation":
+            return "Before acting, compare the task goal against visible status text, field values, modal overlays, and evaluator-relevant evidence."
+        if error_type == "execution":
+            return "After the action, verify that the intended widget received focus/input/click effect; if the screen is unchanged, retry with a grounded target."
+        return "Check whether all prerequisite UI states are satisfied before choosing the next or terminal action."
 
     def _reflection_avoid_when(self, step: Any) -> str:
         """生成失败状态的短描述，用于 prompt 中判断适用条件。"""
@@ -713,6 +805,19 @@ class HierarchicalMemoryStore:
             return "Scroll only when the needed element is off-screen; re-check the visible state after scrolling."
         previous_actions = " -> ".join(item.action.compact() for item in trajectory.steps[max(0, len(trajectory.steps) - 3) :])
         return f"Backtrack from the recent action sequence and choose a different visible UI target. Recent actions: {previous_actions}"
+
+    def _skill_id_for_error(self, error_type: str, step: Any) -> str:
+        if error_type == "observation":
+            return "skill:verify_visible_state_before_terminal_action"
+        if error_type == "execution":
+            if step.action.action_type in {"type", "paste"}:
+                return "skill:ground_text_entry_before_typing"
+            return "skill:ground_action_target_and_verify_effect"
+        if step.action.action_type == "done":
+            return "skill:check_prerequisites_before_done"
+        if step.action.action_type == "fail":
+            return "skill:recover_before_failing"
+        return "skill:prerequisite_aware_next_action"
 
     def _related_image_ids(self, image_nodes: list[MemoryNode], focus_index: int) -> list[str]:
         """选择最接近失败 step 的图像证据节点 id。"""

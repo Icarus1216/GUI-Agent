@@ -412,6 +412,7 @@ Memory consolidation creates:
 - L0 image-evidence nodes for key screenshots,
 - L1 failure-reflection nodes for failed histories,
 - L1 state-action pattern nodes,
+- L2 skill nodes distilled from repeated or important failures,
 - L2 strategy nodes,
 - abstraction/evidence edges.
 
@@ -443,6 +444,23 @@ metadata. They are linked from the trajectory and pattern nodes, so a retrieved
 memory can be traced back to the exact visual state that supported it without
 embedding raw image bytes into the memory JSON.
 
+Failure memory is organized around reusable error reflection rather than raw
+history replay. Each `failure-reflection` classifies the root failure as one of:
+
+- `observation`: the agent misread or over-trusted the GUI state.
+- `decision`: the agent understood the state but chose the wrong policy or
+  prerequisite order.
+- `execution`: the intended policy was reasonable, but the concrete click,
+  typing, focus, hotkey, or scroll did not land correctly.
+
+Reflection nodes keep `root_cause`, `diagnostic_check`, `avoid_when`,
+`recovery_policy`, linked image evidence, and `learned_skill_id`. The
+`MemoryController` then distills these reflections into L2 `skill` nodes such
+as prerequisite checking before `done`, visible-state verification, grounded
+text entry, target grounding, and recovery before failing. Future prompts should
+prefer retrieved `skill` and `failure-reflection` nodes over raw trajectory
+history.
+
 Memory updates are coordinated by `MemoryController`, while
 `HierarchicalMemoryStore` remains the graph persistence layer. The controller is
 responsible for post-update policy:
@@ -450,6 +468,7 @@ responsible for post-update policy:
 - enhancing failure reflections with an optional small VLM/LLM reflection
   client,
 - merging similar failure reflections into a reusable avoid/recover lesson,
+- distilling failure reflections into reusable GUI skills,
 - actively forgetting low-value image evidence when the graph grows past the
   configured node budget.
 

@@ -80,6 +80,7 @@ class MemoryController:
         if self.config.enable_reflection_enhancement:
             self._enhance_failure_reflections(nodes)
         self._merge_failure_reflections()
+        self._consolidate_skills_from_reflections()
         if self.config.enable_active_forgetting:
             self._apply_forgetting_policy()
         if self.store.path:
@@ -114,7 +115,10 @@ class MemoryController:
             [
                 "You are a memory controller for a GUI agent.",
                 "Reflect on the failed GUI trajectory step and return only JSON.",
-                "Required JSON keys: summary, avoid_when, recovery_hint, failure_mode, confidence.",
+                "Required JSON keys: summary, error_type, root_cause, avoid_when, diagnostic_check, recovery_hint, failure_mode, confidence.",
+                "error_type must be one of: observation, decision, execution.",
+                f"Initial error type: {node.metadata.get('error_type')}",
+                f"Initial root cause: {node.metadata.get('root_cause')}",
                 f"Task id: {node.metadata.get('task_id')}",
                 f"Bad action: {node.metadata.get('bad_action')}",
                 f"Screen before action: {node.metadata.get('before_screen_text')}",
@@ -156,16 +160,27 @@ class MemoryController:
         """把小 VLM 反思 JSON 合并回 failure-reflection 节点。"""
 
         summary = _optional_str(payload.get("summary"))
+        error_type = _optional_str(payload.get("error_type"))
+        root_cause = _optional_str(payload.get("root_cause"))
         avoid_when = _optional_str(payload.get("avoid_when"))
+        diagnostic_check = _optional_str(payload.get("diagnostic_check"))
         recovery_hint = _optional_str(payload.get("recovery_hint"))
         failure_mode = _optional_str(payload.get("failure_mode"))
         confidence = payload.get("confidence")
         if summary:
             node.summary = summary
+        if error_type in {"observation", "decision", "execution"}:
+            node.metadata["error_type"] = error_type
+            node.metadata["learned_skill_id"] = _skill_id_for_error_type(error_type, str(node.metadata.get("bad_action_type") or ""))
+        if root_cause:
+            node.metadata["root_cause"] = root_cause
         if avoid_when:
             node.metadata["avoid_when"] = avoid_when
+        if diagnostic_check:
+            node.metadata["diagnostic_check"] = diagnostic_check
         if recovery_hint:
             node.metadata["recovery_hint"] = recovery_hint
+            node.metadata["recovery_policy"] = recovery_hint
             node.action_hints = [recovery_hint]
         if failure_mode:
             node.failure_modes = [failure_mode]
@@ -193,6 +208,7 @@ class MemoryController:
 
     def _find_merge_target(self, node: MemoryNode) -> MemoryNode | None:
         node_action = str(node.metadata.get("bad_action_type") or "")
+        node_error_type = str(node.metadata.get("error_type") or "")
         node_tokens = tokenize(str(node.metadata.get("avoid_when") or node.summary))
         candidates = [
             item
@@ -200,6 +216,7 @@ class MemoryController:
             if item.node_id != node.node_id
             and item.kind == "failure-reflection"
             and str(item.metadata.get("bad_action_type") or "") == node_action
+            and str(item.metadata.get("error_type") or "") == node_error_type
         ]
         best: tuple[float, MemoryNode] | None = None
         for candidate in candidates:
@@ -225,6 +242,96 @@ class MemoryController:
                 *source.metadata.get("image_evidence_ids", []),
             ]
         )
+        target.metadata["root_causes"] = _dedupe(
+            [
+                *target.metadata.get("root_causes", []),
+                str(target.metadata.get("root_cause") or ""),
+                str(source.metadata.get("root_cause") or ""),
+            ]
+        )
+
+    def _consolidate_skills_from_reflections(self) -> None:
+        """把错误反思蒸馏成可复用 GUI skill 节点。
+
+        Skill 是长期 prompt 最应该优先检索的经验：它不记录完整历史，而是
+        保存适用条件、诊断检查和恢复步骤，并链接回支持它的失败证据。
+        """
+
+        reflections = [node for node in self.store.nodes.values() if node.kind == "failure-reflection"]
+        for reflection in reflections:
+            skill_id = str(reflection.metadata.get("learned_skill_id") or "")
+            if not skill_id:
+                continue
+            skill = self.store.nodes.get(skill_id)
+            if skill is None:
+                skill = self._new_skill_from_reflection(skill_id, reflection)
+                self.store.nodes[skill.node_id] = skill
+            else:
+                source_ids = self._reflection_source_ids(reflection)
+                if all(source_id in skill.metadata.get("source_reflection_ids", []) for source_id in source_ids):
+                    self.store.edges.setdefault(skill.node_id, set()).add(reflection.node_id)
+                    continue
+                self._merge_reflection_into_skill(skill, reflection)
+            self.store.edges.setdefault(skill.node_id, set()).add(reflection.node_id)
+            reflection.metadata["learned_skill_id"] = skill.node_id
+
+    def _new_skill_from_reflection(self, skill_id: str, reflection: MemoryNode) -> MemoryNode:
+        error_type = str(reflection.metadata.get("error_type") or "decision")
+        skill_name = _skill_name(skill_id)
+        recovery = str(reflection.metadata.get("recovery_policy") or reflection.metadata.get("recovery_hint") or "")
+        diagnostic = str(reflection.metadata.get("diagnostic_check") or "")
+        avoid_when = str(reflection.metadata.get("avoid_when") or "")
+        return MemoryNode(
+            node_id=skill_id,
+            level=2,
+            kind="skill",
+            summary=f"{skill_name}: handle {error_type} GUI errors by diagnosing state and applying the recovery policy.",
+            evidence_ids=[*self._reflection_source_ids(reflection), *reflection.evidence_ids],
+            preconditions=[avoid_when] if avoid_when else [],
+            action_hints=[recovery] if recovery else [],
+            expected_effects=["Future GUI decisions avoid the reflected failure mode."],
+            failure_modes=list(reflection.failure_modes),
+            confidence=min(0.9, max(0.55, reflection.confidence + 0.05)),
+            success_count=0,
+            tags=_dedupe(["skill", error_type, *reflection.tags]),
+            metadata={
+                "skill_name": skill_name,
+                "error_type": error_type,
+                "applies_when": avoid_when,
+                "procedure": recovery,
+                "check_items": [diagnostic] if diagnostic else [],
+                "recovery_steps": [recovery] if recovery else [],
+                "source_reflection_ids": self._reflection_source_ids(reflection),
+                "source_count": len(self._reflection_source_ids(reflection)),
+            },
+        )
+
+    def _merge_reflection_into_skill(self, skill: MemoryNode, reflection: MemoryNode) -> None:
+        recovery = str(reflection.metadata.get("recovery_policy") or reflection.metadata.get("recovery_hint") or "")
+        diagnostic = str(reflection.metadata.get("diagnostic_check") or "")
+        avoid_when = str(reflection.metadata.get("avoid_when") or "")
+        reflection_source_ids = self._reflection_source_ids(reflection)
+        skill.evidence_ids = _dedupe([*skill.evidence_ids, *reflection_source_ids, *reflection.evidence_ids])
+        if avoid_when:
+            skill.preconditions = _dedupe([*skill.preconditions, avoid_when])[-6:]
+        if recovery:
+            skill.action_hints = _dedupe([*skill.action_hints, recovery])[-6:]
+        skill.failure_modes = _dedupe([*skill.failure_modes, *reflection.failure_modes])[-8:]
+        skill.tags = _dedupe([*skill.tags, *reflection.tags])
+        skill.confidence = min(0.95, max(skill.confidence, reflection.confidence) + 0.03)
+        source_ids = _dedupe([*skill.metadata.get("source_reflection_ids", []), *reflection_source_ids])
+        skill.metadata["source_reflection_ids"] = source_ids
+        skill.metadata["source_count"] = len(source_ids)
+        if avoid_when:
+            skill.metadata["applies_when"] = "; ".join(_dedupe([str(skill.metadata.get("applies_when") or ""), avoid_when])[-3:])
+        if recovery:
+            skill.metadata["procedure"] = recovery
+            skill.metadata["recovery_steps"] = _dedupe([*skill.metadata.get("recovery_steps", []), recovery])[-5:]
+        if diagnostic:
+            skill.metadata["check_items"] = _dedupe([*skill.metadata.get("check_items", []), diagnostic])[-5:]
+
+    def _reflection_source_ids(self, reflection: MemoryNode) -> list[str]:
+        return _dedupe([reflection.node_id, *reflection.metadata.get("merged_reflection_ids", [])])
 
     def _apply_forgetting_policy(self) -> None:
         """主动遗忘低价值节点。
@@ -319,3 +426,21 @@ def _dedupe(values: list[str]) -> list[str]:
             seen.add(value)
             out.append(value)
     return out
+
+
+def _skill_id_for_error_type(error_type: str, action_type: str) -> str:
+    if error_type == "observation":
+        return "skill:verify_visible_state_before_terminal_action"
+    if error_type == "execution":
+        if action_type in {"type", "paste"}:
+            return "skill:ground_text_entry_before_typing"
+        return "skill:ground_action_target_and_verify_effect"
+    if action_type == "done":
+        return "skill:check_prerequisites_before_done"
+    if action_type == "fail":
+        return "skill:recover_before_failing"
+    return "skill:prerequisite_aware_next_action"
+
+
+def _skill_name(skill_id: str) -> str:
+    return skill_id.removeprefix("skill:").replace("_", " ")

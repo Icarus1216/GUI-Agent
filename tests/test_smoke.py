@@ -128,6 +128,10 @@ class SmokeTest(unittest.TestCase):
             self.assertEqual(len(reflections), 1)
             reflection = reflections[0]
             self.assertIn("done", reflection.metadata["bad_action"])
+            self.assertIn(reflection.metadata["error_type"], {"observation", "decision", "execution"})
+            self.assertIn("root_cause", reflection.metadata)
+            self.assertIn("diagnostic_check", reflection.metadata)
+            self.assertTrue(reflection.metadata["learned_skill_id"].startswith("skill:"))
             self.assertIn("Do not call done", reflection.metadata["recovery_hint"])
             self.assertTrue(reflection.metadata["image_evidence_ids"])
             self.assertTrue(any(dst.startswith("image:") for dst in memory.edges[reflection.node_id]))
@@ -170,6 +174,12 @@ class SmokeTest(unittest.TestCase):
             self.assertIn("Bad action", reflector.last_prompt)
             self.assertTrue(reflector.last_image_paths)
             self.assertTrue(Path(reflector.last_image_paths[0]).exists())
+            skills = [node for node in store.nodes.values() if node.kind == "skill"]
+            self.assertEqual(len(skills), 1)
+            self.assertEqual(skills[0].metadata["source_count"], 1)
+            self.assertIn(reflection.node_id, skills[0].metadata["source_reflection_ids"])
+            self.assertIn(skills[0].node_id, store.edges)
+            self.assertIn(reflection.node_id, store.edges[skills[0].node_id])
 
     def test_memory_controller_merges_similar_failure_reflections(self):
         with TemporaryDirectory() as tmp:
@@ -188,6 +198,9 @@ class SmokeTest(unittest.TestCase):
             reflections = [node for node in store.nodes.values() if node.kind == "failure-reflection"]
             self.assertEqual(len(reflections), 1)
             self.assertGreaterEqual(reflections[0].metadata["merged_count"], 2)
+            skills = [node for node in store.nodes.values() if node.kind == "skill"]
+            self.assertEqual(len(skills), 1)
+            self.assertGreaterEqual(skills[0].metadata["source_count"], 2)
 
     def test_memory_controller_forgets_unreferenced_image_evidence_first(self):
         with TemporaryDirectory() as tmp:
