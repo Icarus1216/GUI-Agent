@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -21,7 +22,7 @@ class MemoryReflectionClient(Protocol):
     OpenAI-compatible 小模型，或纯规则 mock。
     """
 
-    def reflect(self, prompt: str) -> str:
+    def reflect(self, prompt: str, image_paths: list[str] | None = None) -> str:
         raise NotImplementedError
 
 
@@ -98,8 +99,9 @@ class MemoryController:
             if node.kind != "failure-reflection":
                 continue
             prompt = self._build_reflection_prompt(node)
+            image_paths = self._reflection_image_paths(node)
             try:
-                payload = _extract_json_object(self.reflection_client.reflect(prompt))
+                payload = _extract_json_object(self._call_reflection_client(prompt, image_paths))
             except (ValueError, TypeError, json.JSONDecodeError):
                 node.metadata["reflection_enhancement_error"] = "invalid reflection JSON"
                 continue
@@ -119,9 +121,36 @@ class MemoryController:
                 f"Screen after action: {node.metadata.get('after_screen_text')}",
                 f"Environment feedback: {node.metadata.get('feedback')}",
                 f"Image evidence ids: {node.metadata.get('image_evidence_ids')}",
+                f"Image evidence paths: {self._reflection_image_paths(node)}",
                 "Do not invent UI elements that are not present in the screen text.",
             ]
         )
+
+    def _reflection_image_paths(self, node: MemoryNode) -> list[str]:
+        """从 failure-reflection 的 evidence id 解析可传给小 VLM 的截图路径。"""
+
+        paths = []
+        for image_id in node.metadata.get("image_evidence_ids", []):
+            image_node = self.store.nodes.get(str(image_id))
+            if image_node is None:
+                continue
+            image_path = image_node.metadata.get("image_path")
+            if image_path:
+                paths.append(str(image_path))
+        return paths
+
+    def _call_reflection_client(self, prompt: str, image_paths: list[str]) -> str:
+        """兼容新旧 reflection client 签名。
+
+        真实小 VLM 客户端可以接收 image_paths；早期测试和规则 mock 只接收
+        prompt，因此这里保留 fallback。
+        """
+
+        assert self.reflection_client is not None
+        signature = inspect.signature(self.reflection_client.reflect)
+        if "image_paths" in signature.parameters:
+            return self.reflection_client.reflect(prompt, image_paths=image_paths)
+        return self.reflection_client.reflect(prompt)
 
     def _apply_reflection_payload(self, node: MemoryNode, payload: dict[str, object]) -> None:
         """把小 VLM 反思 JSON 合并回 failure-reflection 节点。"""

@@ -437,6 +437,27 @@ Without a reflection client, the controller uses deterministic rule-based
 reflection. With a small VLM client, the same node can be refined into a more
 compact summary, avoid condition, recovery hint, and confidence score.
 
+The built-in local reflection backend can use the cached Qwen3.5-4B checkpoint:
+
+```bash
+PYTHONPATH=src python -m vlm_memory_agent \
+  --env local_browser \
+  --vlm-backend rule \
+  --memory-reflection-backend qwen35-local \
+  --memory-reflection-model-path /mnt/hdfs/byte_ai_sales/user/zhangjuntian/model_cache/models/Qwen3.5-4B \
+  --memory-path runs/memory_qwen35_reflection.json \
+  --output runs/trajectory_qwen35_reflection.json
+```
+
+This backend is lazy: it is instantiated by the CLI but only loads the 8.8G
+checkpoint when the controller needs to enhance a `failure-reflection`. The
+controller passes linked `image-evidence` screenshot paths to the Qwen3.5-4B
+client when available, so the reflection can be grounded in traceable visual
+evidence instead of only trajectory text. Online memory evolution then follows
+the same update loop after every episode: write trajectory evidence, create or
+refine failure reflections, merge repeated mistakes into a reusable lesson, and
+forget low-value unreferenced evidence when the node budget is exceeded.
+
 This is enough to run controlled studies on cross-episode experience transfer:
 
 ```text

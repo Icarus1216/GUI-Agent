@@ -120,8 +120,9 @@ class SmokeTest(unittest.TestCase):
 
     def test_memory_controller_enhances_failure_reflection_with_small_vlm(self):
         class FakeReflector:
-            def reflect(self, prompt: str) -> str:
+            def reflect(self, prompt: str, image_paths=None) -> str:
                 self.last_prompt = prompt
+                self.last_image_paths = image_paths or []
                 return (
                     '{"summary":"Do not finish from inbox.","avoid_when":"inbox visible and approval not submitted",'
                     '"recovery_hint":"Open the email and complete the form first.",'
@@ -147,6 +148,8 @@ class SmokeTest(unittest.TestCase):
             self.assertEqual(reflection.action_hints, ["Open the email and complete the form first."])
             self.assertTrue(reflection.metadata["reflection_enhanced"])
             self.assertIn("Bad action", reflector.last_prompt)
+            self.assertTrue(reflector.last_image_paths)
+            self.assertTrue(Path(reflector.last_image_paths[0]).exists())
 
     def test_memory_controller_merges_similar_failure_reflections(self):
         with TemporaryDirectory() as tmp:
@@ -619,6 +622,48 @@ class SmokeTest(unittest.TestCase):
                 )
             self.assertEqual(code, 0)
             self.assertTrue(output.exists())
+
+    def test_cli_default_does_not_create_memory_reflection_client(self):
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "trajectory.json"
+            memory = Path(tmp) / "memory.json"
+            with mock.patch("vlm_memory_agent.cli.Qwen35MemoryReflectionClient") as reflection_client:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = cli_main(["--vlm-backend", "rule", "--output", str(output), "--memory-path", str(memory)])
+        self.assertEqual(code, 0)
+        reflection_client.assert_not_called()
+
+    def test_cli_can_wire_qwen35_memory_reflection_client(self):
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "trajectory.json"
+            memory = Path(tmp) / "memory.json"
+            model_path = Path(tmp) / "Qwen3.5-4B"
+            model_path.mkdir()
+            with mock.patch("vlm_memory_agent.cli.Qwen35MemoryReflectionClient") as reflection_client:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = cli_main(
+                        [
+                            "--vlm-backend",
+                            "rule",
+                            "--memory-reflection-backend",
+                            "qwen35-local",
+                            "--memory-reflection-model-path",
+                            str(model_path),
+                            "--memory-reflection-max-new-tokens",
+                            "64",
+                            "--output",
+                            str(output),
+                            "--memory-path",
+                            str(memory),
+                        ]
+                    )
+        self.assertEqual(code, 0)
+        reflection_client.assert_called_once_with(
+            model_path=str(model_path),
+            device_map="auto",
+            torch_dtype="auto",
+            max_new_tokens=64,
+        )
 
 
 if __name__ == "__main__":

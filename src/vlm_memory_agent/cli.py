@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -17,6 +18,8 @@ from vlm_memory_agent.envs.osworld_runner import OSWorldEnvConfig, build_osworld
 from vlm_memory_agent.llm.openai_compatible import OpenAICompatibleVLMClient
 from vlm_memory_agent.llm.qwen36_local import DEFAULT_QWEN36_MODEL_PATH, Qwen36LocalVLMClient
 from vlm_memory_agent.llm.rule_based import RuleBasedVLMClient
+from vlm_memory_agent.memory.controller import MemoryController, MemoryControllerConfig
+from vlm_memory_agent.memory.reflection_clients import DEFAULT_MEMORY_REFLECTION_MODEL_PATH, Qwen35MemoryReflectionClient
 from vlm_memory_agent.memory.store import HierarchicalMemoryStore
 
 
@@ -83,6 +86,32 @@ def build_env(args: argparse.Namespace):
     )
 
 
+def build_memory_controller(memory: HierarchicalMemoryStore, args: argparse.Namespace) -> MemoryController:
+    """按 CLI 参数构造 memory controller。
+
+    默认只启用规则化 consolidation、合并和主动遗忘，不加载任何小模型；
+    当显式选择 `qwen35-local` 时，才把本地 Qwen3.5-4B 作为反思增强客户端。
+    """
+
+    reflection_client = None
+    if args.memory_reflection_backend == "qwen35-local":
+        reflection_client = Qwen35MemoryReflectionClient(
+            model_path=args.memory_reflection_model_path,
+            device_map=args.memory_reflection_device_map,
+            torch_dtype=args.memory_reflection_torch_dtype,
+            max_new_tokens=args.memory_reflection_max_new_tokens,
+        )
+    return MemoryController(
+        memory,
+        reflection_client=reflection_client,
+        config=MemoryControllerConfig(
+            max_nodes=args.memory_max_nodes,
+            enable_reflection_enhancement=not args.disable_memory_reflection_enhancement,
+            enable_active_forgetting=not args.disable_active_forgetting,
+        ),
+    )
+
+
 def run(args: argparse.Namespace) -> int:
     """CLI 主执行流程。
 
@@ -92,9 +121,11 @@ def run(args: argparse.Namespace) -> int:
     """
 
     memory = HierarchicalMemoryStore(args.memory_path)
+    memory_controller = build_memory_controller(memory, args)
     agent = VLMGuiAgent(
         vlm=build_vlm(args),
         memory=memory,
+        memory_controller=memory_controller,
         config=AgentConfig(max_steps=args.max_steps, retrieve_k=args.retrieve_k, update_memory=not args.no_memory_update),
     )
     env = build_env(args)
@@ -126,6 +157,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-steps", type=int, default=10)
     parser.add_argument("--retrieve-k", type=int, default=4)
     parser.add_argument("--no-memory-update", action="store_true")
+    parser.add_argument(
+        "--memory-reflection-backend",
+        choices=["none", "qwen35-local"],
+        default=os.environ.get("MEMORY_REFLECTION_BACKEND", "none"),
+    )
+    parser.add_argument(
+        "--memory-reflection-model-path",
+        default=os.environ.get("MEMORY_REFLECTION_MODEL_PATH", DEFAULT_MEMORY_REFLECTION_MODEL_PATH),
+    )
+    parser.add_argument("--memory-reflection-device-map", default=os.environ.get("MEMORY_REFLECTION_DEVICE_MAP", "auto"))
+    parser.add_argument("--memory-reflection-torch-dtype", default=os.environ.get("MEMORY_REFLECTION_TORCH_DTYPE", "auto"))
+    parser.add_argument("--memory-reflection-max-new-tokens", type=int, default=256)
+    parser.add_argument("--memory-max-nodes", type=int, default=2000)
+    parser.add_argument("--disable-memory-reflection-enhancement", action="store_true")
+    parser.add_argument("--disable-active-forgetting", action="store_true")
     parser.add_argument("--vlm-backend", choices=["rule", "openai", "qwen36-local"], default="rule")
     parser.add_argument("--model", default="gpt-4o")
     parser.add_argument("--base-url", default=None)

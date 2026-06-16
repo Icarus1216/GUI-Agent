@@ -4,12 +4,15 @@
 """
 
 from vlm_memory_agent.memory.controller import MemoryController, MemoryControllerConfig, MemoryReflectionClient
+from vlm_memory_agent.memory.reflection_clients import DEFAULT_MEMORY_REFLECTION_MODEL_PATH, Qwen35MemoryReflectionClient
 from vlm_memory_agent.memory.store import HierarchicalMemoryStore, MemoryNode
 
 __all__ = [
+    "DEFAULT_MEMORY_REFLECTION_MODEL_PATH",
     "HierarchicalMemoryStore",
     "MemoryController",
     "MemoryControllerConfig",
     "MemoryNode",
     "MemoryReflectionClient",
+    "Qwen35MemoryReflectionClient",
 ]
