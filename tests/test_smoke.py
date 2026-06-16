@@ -80,14 +80,18 @@ class SmokeTest(unittest.TestCase):
             trajectory_nodes = [node for node in nodes if node.kind == "trajectory"]
             self.assertEqual(len(trajectory_nodes), 1)
             leaf = trajectory_nodes[0]
-            self.assertEqual(leaf.metadata["trajectory_schema"], "interleaved_multimodal_v1")
+            self.assertEqual(leaf.metadata["trajectory_schema"], "adaptive_interleaved_multimodal_v1")
             self.assertEqual(leaf.metadata["step_count"], len(trajectory.steps))
-            first_step = leaf.metadata["interleaved_steps"][0]
-            self.assertIn("screenshot_path", first_step["before"])
-            self.assertIn("action_type", first_step["action"])
-            self.assertIn("screenshot_path", first_step["after"])
-            self.assertIn("feedback", first_step["verification"])
-            self.assertIn(first_step["verification"]["verdict"], {"progress", "correct", "wrong"})
+            units = leaf.metadata["interleaved_units"]
+            self.assertLess(len(units), len(trajectory.steps))
+            self.assertEqual(units[0]["type"], "segment")
+            self.assertEqual(units[0]["resolution"], "low")
+            self.assertIn("screenshot_path", units[0]["start"])
+            self.assertIn("screenshot_path", units[0]["end"])
+            self.assertTrue(units[0]["actions"])
+            self.assertEqual(units[-1]["type"], "keyframe_step")
+            self.assertEqual(units[-1]["verification"]["verdict"], "correct")
+            self.assertGreaterEqual(leaf.metadata["compression"]["compressed_progress_steps"], 1)
             self.assertTrue(any(eid.startswith("image:") for eid in leaf.evidence_ids))
             self.assertTrue(any(dst.startswith("image:") for dst in memory.edges[leaf.node_id]))
 
@@ -112,6 +116,13 @@ class SmokeTest(unittest.TestCase):
 
             memory = HierarchicalMemoryStore(Path(tmp) / "memory.json")
             nodes = memory.update_from_trajectory(trajectory)
+            leaf = next(node for node in nodes if node.kind == "trajectory")
+            full_step = leaf.metadata["interleaved_units"][0]
+            self.assertEqual(full_step["type"], "full_step")
+            self.assertEqual(full_step["resolution"], "high")
+            self.assertEqual(full_step["verification"]["verdict"], "wrong")
+            self.assertIn("before", full_step)
+            self.assertIn("after", full_step)
             reflections = [node for node in nodes if node.kind == "failure-reflection"]
             self.assertEqual(len(reflections), 1)
             reflection = reflections[0]

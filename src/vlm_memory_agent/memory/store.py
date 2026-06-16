@@ -15,6 +15,9 @@ from typing import Any
 from vlm_memory_agent.core.types import StepStatus, Trajectory
 
 
+ADAPTIVE_TRAJECTORY_SCHEMA = "adaptive_interleaved_multimodal_v1"
+
+
 def tokenize(text: str) -> set[str]:
     """把任务、屏幕文本和经验摘要转成轻量检索 token。
 
@@ -226,13 +229,15 @@ class HierarchicalMemoryStore:
         """把原始 trajectory 压缩成 L0 evidence node。
 
         summary/action_hints 是给检索和 prompt 使用的抽象视图；metadata 中的
-        `interleaved_steps` 保留逐步交错模态原始证据：动作前 GUI 状态、
-        action、动作后 GUI 状态，以及环境/evaluator 对这一步的 verify。
+        `interleaved_units` 按价值动态选择分辨率：错误 step 保留完整
+        before/action/after/verify，成功终态保留 keyframe，连续 progress
+        压成只含首尾 GUI 状态和动作序列的 segment。
         """
 
         status = "success" if trajectory.success else "failure"
         action_trace = " -> ".join(step.action.compact() for step in trajectory.steps)
         feedback = " | ".join(step.feedback for step in trajectory.steps[-3:])
+        interleaved_units = self._adaptive_interleaved_units(trajectory)
         node = MemoryNode(
             node_id=f"traj:{trajectory.task_id}:{len(self.nodes)}",
             level=0,
@@ -247,47 +252,142 @@ class HierarchicalMemoryStore:
             success_count=1 if trajectory.success else 0,
             tags=list(tokenize(trajectory.task))[:8],
             metadata={
-                "trajectory_schema": "interleaved_multimodal_v1",
+                "trajectory_schema": ADAPTIVE_TRAJECTORY_SCHEMA,
                 "task_id": trajectory.task_id,
                 "task": trajectory.task,
                 "success": trajectory.success,
                 "step_count": len(trajectory.steps),
-                "interleaved_steps": [
-                    self._interleaved_step_payload(index, step) for index, step in enumerate(trajectory.steps)
-                ],
+                "resolution_policy": {
+                    "wrong": "full_step",
+                    "correct": "keyframe_step",
+                    "progress": "segment",
+                },
+                "interleaved_units": interleaved_units,
+                "compression": self._compression_stats(trajectory, interleaved_units),
             },
         )
         return node
 
-    def _interleaved_step_payload(self, index: int, step: Any) -> dict[str, Any]:
-        """保留单步交错模态 trajectory 原始证据。
+    def _adaptive_interleaved_units(self, trajectory: Trajectory) -> list[dict[str, Any]]:
+        """把 step 序列压缩成动态分辨率的交错模态 units。"""
 
-        `verification.verdict` 区分 progress/correct/wrong：RUNNING step
-        代表动作未被判错但仍需继续，SUCCESS/FAILED 才分别写成明确正确或
-        错误，具体原因保存在 feedback/metadata 中。
-        """
+        units: list[dict[str, Any]] = []
+        progress_buffer: list[tuple[int, Any]] = []
+
+        def flush_progress() -> None:
+            if not progress_buffer:
+                return
+            units.append(self._progress_segment_unit(progress_buffer))
+            progress_buffer.clear()
+
+        for index, step in enumerate(trajectory.steps):
+            if step.status == StepStatus.RUNNING:
+                progress_buffer.append((index, step))
+                continue
+            flush_progress()
+            if step.status == StepStatus.FAILED:
+                units.append(self._full_step_unit(index, step, retention_reason="wrong_or_failed_step"))
+            elif step.status == StepStatus.SUCCESS:
+                units.append(self._keyframe_step_unit(index, step, retention_reason="terminal_success_evidence"))
+        flush_progress()
+        return units
+
+    def _progress_segment_unit(self, buffered_steps: list[tuple[int, Any]]) -> dict[str, Any]:
+        """把连续进行中的普通步骤压成一个低分辨率 segment。"""
+
+        start_index, first_step = buffered_steps[0]
+        end_index, last_step = buffered_steps[-1]
+        end_observation = last_step.next_observation or last_step.observation
+        return {
+            "type": "segment",
+            "resolution": "low",
+            "retention_reason": "routine_progress",
+            "step_range": [start_index, end_index],
+            "step_count": len(buffered_steps),
+            "verdict": "progress",
+            "start": self._observation_evidence(first_step.observation, max_screen_chars=1200),
+            "end": self._observation_evidence(end_observation, max_screen_chars=1200),
+            "actions": [
+                {
+                    "step_index": index,
+                    "compact": step.action.compact(),
+                    "thought": step.action.thought,
+                    "feedback": step.feedback,
+                }
+                for index, step in buffered_steps
+            ],
+            "omitted_intermediate_gui_states": max(0, len(buffered_steps) - 1),
+        }
+
+    def _full_step_unit(self, index: int, step: Any, retention_reason: str) -> dict[str, Any]:
+        """高分辨率保留错误/失败 step 的完整交错模态证据。"""
+
+        payload = self._interleaved_step_payload(index, step, max_screen_chars=4000)
+        payload.update({"type": "full_step", "resolution": "high", "retention_reason": retention_reason})
+        return payload
+
+    def _keyframe_step_unit(self, index: int, step: Any, retention_reason: str) -> dict[str, Any]:
+        """中分辨率保留终态成功证据。"""
+
+        return {
+            "type": "keyframe_step",
+            "resolution": "medium",
+            "retention_reason": retention_reason,
+            "step_index": index,
+            "before": self._observation_evidence(step.observation, max_screen_chars=1600),
+            "action": step.action.to_dict(),
+            "after": self._observation_evidence(step.next_observation, max_screen_chars=1600) if step.next_observation else None,
+            "verification": self._verification_payload(step),
+        }
+
+    def _interleaved_step_payload(self, index: int, step: Any, max_screen_chars: int = 4000) -> dict[str, Any]:
+        """构造未压缩的单步 before/action/after/verification 证据。"""
+
+        return {
+            "step_index": index,
+            "before": self._observation_evidence(step.observation, max_screen_chars=max_screen_chars),
+            "action": step.action.to_dict(),
+            "after": self._observation_evidence(step.next_observation, max_screen_chars=max_screen_chars) if step.next_observation else None,
+            "verification": self._verification_payload(step),
+        }
+
+    def _verification_payload(self, step: Any) -> dict[str, Any]:
+        """把 step 结果归一化为 correct/wrong/progress 验证块。"""
 
         verdict = "correct" if step.status == StepStatus.SUCCESS else "wrong" if step.status == StepStatus.FAILED else "progress"
         return {
-            "step_index": index,
-            "before": self._observation_evidence(step.observation),
-            "action": step.action.to_dict(),
-            "after": self._observation_evidence(step.next_observation) if step.next_observation else None,
-            "verification": {
-                "status": step.status.value,
-                "verdict": verdict,
-                "correct": True if step.status == StepStatus.SUCCESS else False if step.status == StepStatus.FAILED else None,
-                "failed": step.status == StepStatus.FAILED,
-                "reward": step.reward,
-                "feedback": step.feedback,
-                "metadata": _json_safe_value(step.metadata),
-            },
+            "status": step.status.value,
+            "verdict": verdict,
+            "correct": True if step.status == StepStatus.SUCCESS else False if step.status == StepStatus.FAILED else None,
+            "failed": step.status == StepStatus.FAILED,
+            "reward": step.reward,
+            "feedback": step.feedback,
+            "metadata": _json_safe_value(step.metadata),
         }
 
-    def _observation_evidence(self, observation: Any) -> dict[str, Any]:
+    def _observation_evidence(self, observation: Any, max_screen_chars: int = 4000) -> dict[str, Any]:
         """把 observation 转成适合嵌入 trajectory node 的 GUI 状态证据。"""
 
-        return observation.to_dict()
+        payload = observation.to_dict()
+        payload["screen_text"] = self._trim(str(payload.get("screen_text") or ""), max_screen_chars)
+        return payload
+
+    def _compression_stats(self, trajectory: Trajectory, units: list[dict[str, Any]]) -> dict[str, Any]:
+        """记录自适应压缩效果，便于后续实验分析 memory 体积。"""
+
+        full_steps = sum(1 for unit in units if unit.get("type") == "full_step")
+        keyframes = sum(1 for unit in units if unit.get("type") == "keyframe_step")
+        segments = [unit for unit in units if unit.get("type") == "segment"]
+        compressed_progress_steps = sum(int(unit.get("step_count", 0)) for unit in segments)
+        return {
+            "raw_step_count": len(trajectory.steps),
+            "unit_count": len(units),
+            "full_step_units": full_steps,
+            "keyframe_step_units": keyframes,
+            "segment_units": len(segments),
+            "compressed_progress_steps": compressed_progress_steps,
+            "estimated_gui_state_count": full_steps * 2 + keyframes * 2 + len(segments) * 2,
+        }
 
     def _image_evidence_nodes(self, trajectory: Trajectory, leaf_id: str) -> list[MemoryNode]:
         """从 trajectory 中抽取关键截图并生成 image-evidence 节点。
