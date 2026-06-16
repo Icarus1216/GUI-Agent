@@ -15,7 +15,7 @@ from typing import Any
 from vlm_memory_agent.core.types import StepStatus, Trajectory
 
 
-ADAPTIVE_TRAJECTORY_SCHEMA = "adaptive_interleaved_multimodal_v1"
+ANCHOR_TRAJECTORY_SCHEMA = "decision_anchor_multimodal_v1"
 
 
 def tokenize(text: str) -> set[str]:
@@ -110,9 +110,15 @@ class HierarchicalMemoryStore:
     deliberately simple and inspectable so methods can replace it later.
     """
 
-    def __init__(self, path: str | Path | None = None, max_image_evidence_per_trajectory: int = 6):
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        max_image_evidence_per_trajectory: int = 6,
+        max_decision_anchors_per_trajectory: int = 4,
+    ):
         self.path = Path(path) if path else None
         self.max_image_evidence_per_trajectory = max_image_evidence_per_trajectory
+        self.max_decision_anchors_per_trajectory = max_decision_anchors_per_trajectory
         self.nodes: dict[str, MemoryNode] = {}
         self.edges: dict[str, set[str]] = {}
         if self.path and self.path.exists():
@@ -149,7 +155,7 @@ class HierarchicalMemoryStore:
         """
 
         leaf = self._trajectory_leaf(trajectory)
-        image_nodes = self._image_evidence_nodes(trajectory, leaf.node_id)
+        image_nodes = self._image_evidence_nodes(trajectory, leaf)
         leaf.evidence_ids.extend(node.node_id for node in image_nodes)
         self.nodes[leaf.node_id] = leaf
         for image_node in image_nodes:
@@ -229,125 +235,120 @@ class HierarchicalMemoryStore:
         """把原始 trajectory 压缩成 L0 evidence node。
 
         summary/action_hints 是给检索和 prompt 使用的抽象视图；metadata 中的
-        `interleaved_units` 按价值动态选择分辨率：错误 step 保留完整
-        before/action/after/verify，成功终态保留 keyframe，连续 progress
-        压成只含首尾 GUI 状态和动作序列的 segment。
+        `decision_anchors` 只保存值得复用为经验的关键决策节点；普通 plain
+        steps 被压成统计摘要，不再逐步写入长期 memory。
         """
 
         status = "success" if trajectory.success else "failure"
-        action_trace = " -> ".join(step.action.compact() for step in trajectory.steps)
+        decision_anchors = self._decision_anchor_units(trajectory)
+        anchor_trace = " -> ".join(unit["action"]["compact"] for unit in decision_anchors) or "no retained anchor"
         feedback = " | ".join(step.feedback for step in trajectory.steps[-3:])
-        interleaved_units = self._adaptive_interleaved_units(trajectory)
         node = MemoryNode(
             node_id=f"traj:{trajectory.task_id}:{len(self.nodes)}",
             level=0,
             kind="trajectory",
-            summary=f"{status} trajectory for: {trajectory.task}. Actions: {action_trace}. Feedback: {feedback}",
+            summary=(
+                f"{status} trajectory for: {trajectory.task}. "
+                f"Retained decision anchors: {anchor_trace}. Feedback: {feedback}"
+            ),
             evidence_ids=[trajectory.task_id],
             preconditions=[self._trim(trajectory.steps[0].observation.screen_text, 2000)] if trajectory.steps else [],
-            action_hints=[step.action.compact() for step in trajectory.steps],
+            action_hints=[unit["action"]["compact"] for unit in decision_anchors],
             expected_effects=[step.feedback for step in trajectory.steps if step.status == StepStatus.SUCCESS],
             failure_modes=[step.feedback for step in trajectory.steps if step.status == StepStatus.FAILED],
             confidence=0.7 if trajectory.success else 0.45,
             success_count=1 if trajectory.success else 0,
             tags=list(tokenize(trajectory.task))[:8],
             metadata={
-                "trajectory_schema": ADAPTIVE_TRAJECTORY_SCHEMA,
+                "trajectory_schema": ANCHOR_TRAJECTORY_SCHEMA,
                 "task_id": trajectory.task_id,
                 "task": trajectory.task,
                 "success": trajectory.success,
                 "step_count": len(trajectory.steps),
                 "resolution_policy": {
-                    "wrong": "full_step",
-                    "correct": "keyframe_step",
-                    "progress": "segment",
+                    "wrong": "decision_anchor/full",
+                    "correct": "decision_anchor/keyframe",
+                    "difficult_progress": "decision_anchor/keyframe",
+                    "plain_progress": "omitted_summary",
                 },
-                "interleaved_units": interleaved_units,
-                "compression": self._compression_stats(trajectory, interleaved_units),
+                "decision_anchors": decision_anchors,
+                "plain_step_summary": self._plain_step_summary(trajectory, decision_anchors),
+                "compression": self._compression_stats(trajectory, decision_anchors),
             },
         )
         return node
 
-    def _adaptive_interleaved_units(self, trajectory: Trajectory) -> list[dict[str, Any]]:
-        """把 step 序列压缩成动态分辨率的交错模态 units。"""
+    def _decision_anchor_units(self, trajectory: Trajectory) -> list[dict[str, Any]]:
+        """选择少量关键决策步骤作为长期 memory 锚点。"""
 
-        units: list[dict[str, Any]] = []
-        progress_buffer: list[tuple[int, Any]] = []
-
-        def flush_progress() -> None:
-            if not progress_buffer:
-                return
-            units.append(self._progress_segment_unit(progress_buffer))
-            progress_buffer.clear()
-
+        scored: list[tuple[int, int, list[str], Any]] = []
         for index, step in enumerate(trajectory.steps):
-            if step.status == StepStatus.RUNNING:
-                progress_buffer.append((index, step))
-                continue
-            flush_progress()
-            if step.status == StepStatus.FAILED:
-                units.append(self._full_step_unit(index, step, retention_reason="wrong_or_failed_step"))
-            elif step.status == StepStatus.SUCCESS:
-                units.append(self._keyframe_step_unit(index, step, retention_reason="terminal_success_evidence"))
-        flush_progress()
-        return units
+            score, reasons = self._decision_anchor_score(index, step, trajectory)
+            if score >= 35 or step.status != StepStatus.RUNNING:
+                scored.append((score, index, reasons, step))
+        scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+        selected = sorted(scored[: self.max_decision_anchors_per_trajectory], key=lambda item: item[1])
+        return [self._decision_anchor_unit(index, step, score, reasons) for score, index, reasons, step in selected]
 
-    def _progress_segment_unit(self, buffered_steps: list[tuple[int, Any]]) -> dict[str, Any]:
-        """把连续进行中的普通步骤压成一个低分辨率 segment。"""
+    def _decision_anchor_score(self, index: int, step: Any, trajectory: Trajectory) -> tuple[int, list[str]]:
+        """用可解释启发式估计某一步是否值得成为经验锚点。"""
 
-        start_index, first_step = buffered_steps[0]
-        end_index, last_step = buffered_steps[-1]
-        end_observation = last_step.next_observation or last_step.observation
+        score = 0
+        reasons: list[str] = []
+        if step.status == StepStatus.FAILED:
+            score += 100
+            reasons.append("wrong_or_failed")
+        if step.status == StepStatus.SUCCESS:
+            score += 90
+            reasons.append("terminal_success")
+        if step.reward:
+            score += 20
+            reasons.append("nonzero_reward")
+        if step.action.action_type in {"done", "fail"}:
+            score += 30
+            reasons.append("terminal_decision")
+        if step.action.action_type in {"hotkey", "press", "paste", "right_click", "double_click"}:
+            score += 20
+            reasons.append("risky_action_type")
+        if step.action.action_type in {"type", "paste"} and step.action.text:
+            score += 18
+            reasons.append("exact_text_entry")
+        if self._metadata_value(step.observation, "page") != self._metadata_value(step.next_observation, "page"):
+            score += 24
+            reasons.append("gui_state_transition")
+        if len(step.observation.ui_elements) >= 4:
+            score += 8
+            reasons.append("multi_choice_screen")
+        feedback = (step.feedback or "").lower()
+        if any(keyword in feedback for keyword in ("error", "failed", "cannot", "invalid", "blocked")):
+            score += 40
+            reasons.append("negative_feedback")
+        if any(keyword in feedback for keyword in ("submitted", "completed", "saved", "approved")):
+            score += 24
+            reasons.append("goal_or_commit_feedback")
+        if self._screen_change_score(step) >= 0.65:
+            score += 10
+            reasons.append("large_screen_change")
+        if index == len(trajectory.steps) - 1:
+            score += 10
+            reasons.append("episode_tail")
+        return score, self._dedupe(reasons)
+
+    def _decision_anchor_unit(self, index: int, step: Any, score: int, reasons: list[str]) -> dict[str, Any]:
+        """构造关键决策锚点。"""
+
+        is_wrong = step.status == StepStatus.FAILED
+        resolution = "full" if is_wrong else "keyframe"
+        max_chars = 4000 if is_wrong else 1800
         return {
-            "type": "segment",
-            "resolution": "low",
-            "retention_reason": "routine_progress",
-            "step_range": [start_index, end_index],
-            "step_count": len(buffered_steps),
-            "verdict": "progress",
-            "start": self._observation_evidence(first_step.observation, max_screen_chars=1200),
-            "end": self._observation_evidence(end_observation, max_screen_chars=1200),
-            "actions": [
-                {
-                    "step_index": index,
-                    "compact": step.action.compact(),
-                    "thought": step.action.thought,
-                    "feedback": step.feedback,
-                }
-                for index, step in buffered_steps
-            ],
-            "omitted_intermediate_gui_states": max(0, len(buffered_steps) - 1),
-        }
-
-    def _full_step_unit(self, index: int, step: Any, retention_reason: str) -> dict[str, Any]:
-        """高分辨率保留错误/失败 step 的完整交错模态证据。"""
-
-        payload = self._interleaved_step_payload(index, step, max_screen_chars=4000)
-        payload.update({"type": "full_step", "resolution": "high", "retention_reason": retention_reason})
-        return payload
-
-    def _keyframe_step_unit(self, index: int, step: Any, retention_reason: str) -> dict[str, Any]:
-        """中分辨率保留终态成功证据。"""
-
-        return {
-            "type": "keyframe_step",
-            "resolution": "medium",
-            "retention_reason": retention_reason,
+            "type": "decision_anchor",
+            "resolution": resolution,
             "step_index": index,
-            "before": self._observation_evidence(step.observation, max_screen_chars=1600),
+            "anchor_score": score,
+            "retention_reasons": reasons,
+            "before": self._observation_evidence(step.observation, max_screen_chars=max_chars),
             "action": step.action.to_dict(),
-            "after": self._observation_evidence(step.next_observation, max_screen_chars=1600) if step.next_observation else None,
-            "verification": self._verification_payload(step),
-        }
-
-    def _interleaved_step_payload(self, index: int, step: Any, max_screen_chars: int = 4000) -> dict[str, Any]:
-        """构造未压缩的单步 before/action/after/verification 证据。"""
-
-        return {
-            "step_index": index,
-            "before": self._observation_evidence(step.observation, max_screen_chars=max_screen_chars),
-            "action": step.action.to_dict(),
-            "after": self._observation_evidence(step.next_observation, max_screen_chars=max_screen_chars) if step.next_observation else None,
+            "after": self._observation_evidence(step.next_observation, max_screen_chars=max_chars) if step.next_observation else None,
             "verification": self._verification_payload(step),
         }
 
@@ -372,48 +373,72 @@ class HierarchicalMemoryStore:
         payload["screen_text"] = self._trim(str(payload.get("screen_text") or ""), max_screen_chars)
         return payload
 
-    def _compression_stats(self, trajectory: Trajectory, units: list[dict[str, Any]]) -> dict[str, Any]:
-        """记录自适应压缩效果，便于后续实验分析 memory 体积。"""
+    def _plain_step_summary(self, trajectory: Trajectory, anchors: list[dict[str, Any]]) -> dict[str, Any]:
+        """把非锚点步骤压成统计摘要，避免长期 memory 保存 plain 逐步细节。"""
 
-        full_steps = sum(1 for unit in units if unit.get("type") == "full_step")
-        keyframes = sum(1 for unit in units if unit.get("type") == "keyframe_step")
-        segments = [unit for unit in units if unit.get("type") == "segment"]
-        compressed_progress_steps = sum(int(unit.get("step_count", 0)) for unit in segments)
+        anchor_indices = {int(anchor["step_index"]) for anchor in anchors}
+        plain_steps = [(index, step) for index, step in enumerate(trajectory.steps) if index not in anchor_indices]
+        action_type_counts: dict[str, int] = {}
+        verdict_counts: dict[str, int] = {}
+        sampled_feedback: list[str] = []
+        for _, step in plain_steps:
+            action_type_counts[step.action.action_type] = action_type_counts.get(step.action.action_type, 0) + 1
+            verdict = self._verification_payload(step)["verdict"]
+            verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
+            if step.feedback and len(sampled_feedback) < 3 and step.feedback not in sampled_feedback:
+                sampled_feedback.append(step.feedback)
         return {
-            "raw_step_count": len(trajectory.steps),
-            "unit_count": len(units),
-            "full_step_units": full_steps,
-            "keyframe_step_units": keyframes,
-            "segment_units": len(segments),
-            "compressed_progress_steps": compressed_progress_steps,
-            "estimated_gui_state_count": full_steps * 2 + keyframes * 2 + len(segments) * 2,
+            "omitted_step_count": len(plain_steps),
+            "omitted_step_ranges": self._contiguous_ranges([index for index, _ in plain_steps]),
+            "action_type_counts": action_type_counts,
+            "verdict_counts": verdict_counts,
+            "sampled_feedback": sampled_feedback,
         }
 
-    def _image_evidence_nodes(self, trajectory: Trajectory, leaf_id: str) -> list[MemoryNode]:
+    def _compression_stats(self, trajectory: Trajectory, anchors: list[dict[str, Any]]) -> dict[str, Any]:
+        """记录锚点抽象压缩效果，便于后续实验分析 memory 体积。"""
+
+        full_resolution = sum(1 for anchor in anchors if anchor.get("resolution") == "full")
+        keyframes = sum(1 for anchor in anchors if anchor.get("resolution") == "keyframe")
+        omitted = max(0, len(trajectory.steps) - len(anchors))
+        return {
+            "raw_step_count": len(trajectory.steps),
+            "decision_anchor_count": len(anchors),
+            "omitted_plain_step_count": omitted,
+            "full_resolution_anchor_count": full_resolution,
+            "keyframe_anchor_count": keyframes,
+            "estimated_gui_state_count": len(anchors) * 2,
+        }
+
+    def _image_evidence_nodes(self, trajectory: Trajectory, leaf: MemoryNode) -> list[MemoryNode]:
         """从 trajectory 中抽取关键截图并生成 image-evidence 节点。
 
-        选择策略保持保守和可解释：
-        - 首帧 before screenshot，记录任务起始状态；
-        - 每个非 wait 动作后的 after screenshot，记录动作效果；
-        - 任何成功/失败终态 after screenshot，记录 evaluator 结论对应画面。
-
-        通过 screenshot_path 去重，并限制每条 trajectory 的图像证据数量，
-        避免长程任务把 memory JSON 膨胀成逐帧日志。
+        选择策略围绕 decision anchors：优先保留关键决策节点前后的截图；
+        如预算仍有余量，再保留 episode 首帧和终态截图作为上下文。
         """
 
-        candidates: list[tuple[int, str, str, Any]] = []
+        leaf_id = leaf.node_id
+        anchor_indices = {int(anchor["step_index"]) for anchor in leaf.metadata.get("decision_anchors", [])}
+        candidates: list[tuple[int, int, str, str, Any]] = []
         for index, step in enumerate(trajectory.steps):
-            if index == 0 and step.observation.screenshot_path:
-                candidates.append((index, "before", step.observation.screenshot_path, step))
+            if index not in anchor_indices:
+                continue
+            if step.observation.screenshot_path:
+                candidates.append((0, index, "before", step.observation.screenshot_path, step))
             if step.next_observation and step.next_observation.screenshot_path:
-                is_terminal = step.status != StepStatus.RUNNING
-                is_action_effect = step.action.action_type != "wait"
-                if is_action_effect or is_terminal:
-                    candidates.append((index, "after", step.next_observation.screenshot_path, step))
+                candidates.append((0, index, "after", step.next_observation.screenshot_path, step))
+        if trajectory.steps:
+            first = trajectory.steps[0]
+            if first.observation.screenshot_path:
+                candidates.append((5, 0, "before", first.observation.screenshot_path, first))
+            tail_index = len(trajectory.steps) - 1
+            tail = trajectory.steps[-1]
+            if tail.next_observation and tail.next_observation.screenshot_path:
+                candidates.append((5, tail_index, "after", tail.next_observation.screenshot_path, tail))
 
         nodes: list[MemoryNode] = []
         seen_paths: set[str] = set()
-        for index, phase, screenshot_path, step in candidates:
+        for _, index, phase, screenshot_path, step in sorted(candidates, key=lambda item: (item[0], item[1], item[2])):
             if screenshot_path in seen_paths:
                 continue
             seen_paths.add(screenshot_path)
@@ -455,6 +480,34 @@ class HierarchicalMemoryStore:
                 )
             )
         return nodes
+
+    def _metadata_value(self, observation: Any | None, key: str) -> object:
+        if observation is None:
+            return None
+        return getattr(observation, "metadata", {}).get(key)
+
+    def _screen_change_score(self, step: Any) -> float:
+        if step.next_observation is None:
+            return 0.0
+        before = tokenize(step.observation.screen_text)
+        after = tokenize(step.next_observation.screen_text)
+        if not before and not after:
+            return 0.0
+        return 1.0 - jaccard(before, after)
+
+    def _contiguous_ranges(self, indices: list[int]) -> list[list[int]]:
+        if not indices:
+            return []
+        ranges: list[list[int]] = []
+        start = prev = indices[0]
+        for index in indices[1:]:
+            if index == prev + 1:
+                prev = index
+                continue
+            ranges.append([start, prev])
+            start = prev = index
+        ranges.append([start, prev])
+        return ranges
 
     def _failure_reflection_node(
         self,

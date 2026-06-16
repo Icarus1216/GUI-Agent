@@ -418,20 +418,23 @@ Memory consolidation creates:
 L0 `trajectory` nodes keep two views of the same episode. The top-level
 `summary`, `preconditions`, `action_hints`, `expected_effects`, and
 `failure_modes` fields are compact retrieval/prompt features. The node metadata
-keeps adaptive interleaved multimodal evidence under
-`trajectory_schema=adaptive_interleaved_multimodal_v1` and
-`interleaved_units`. The store uses dynamic graph resolution compression:
+keeps anchor-centric multimodal evidence under
+`trajectory_schema=decision_anchor_multimodal_v1`. Instead of storing every
+plain step, the store selects a small number of `decision_anchors`:
 
-- `wrong` / failed steps are retained as high-resolution `full_step` units with
-  complete `before`, `action`, `after`, and `verification` evidence.
-- terminal `correct` steps are retained as medium-resolution `keyframe_step`
-  units with before/after success evidence.
-- consecutive non-terminal `progress` steps are compressed into low-resolution
-  `segment` units that keep only start/end GUI keyframes plus the action and
-  feedback sequence.
+- `wrong` / failed steps are retained as full-resolution anchors with complete
+  `before`, `action`, `after`, and `verification` evidence.
+- terminal `correct` steps are retained as success keyframe anchors.
+- difficult progress steps can be retained when the heuristic score indicates
+  state transition, exact text entry, risky action type, large screen change, or
+  commit-like feedback.
+- plain progress steps are omitted from the graph and summarized in
+  `plain_step_summary` as counts, contiguous ranges, action-type distribution,
+  verdict distribution, and a few sample feedback strings.
 
-Each `verification.verdict` is `progress`, `correct`, or `wrong`, so useful
-non-terminal progress is not conflated with a failed action. Compression
+Each anchor stores `anchor_score` and `retention_reasons` so the compression is
+auditable. Each `verification.verdict` is `progress`, `correct`, or `wrong`, so
+useful non-terminal progress is not conflated with a failed action. Compression
 statistics are stored in `metadata.compression`.
 
 `image-evidence` nodes store the screenshot path, trajectory node id, step

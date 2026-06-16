@@ -80,18 +80,18 @@ class SmokeTest(unittest.TestCase):
             trajectory_nodes = [node for node in nodes if node.kind == "trajectory"]
             self.assertEqual(len(trajectory_nodes), 1)
             leaf = trajectory_nodes[0]
-            self.assertEqual(leaf.metadata["trajectory_schema"], "adaptive_interleaved_multimodal_v1")
+            self.assertEqual(leaf.metadata["trajectory_schema"], "decision_anchor_multimodal_v1")
             self.assertEqual(leaf.metadata["step_count"], len(trajectory.steps))
-            units = leaf.metadata["interleaved_units"]
-            self.assertLess(len(units), len(trajectory.steps))
-            self.assertEqual(units[0]["type"], "segment")
-            self.assertEqual(units[0]["resolution"], "low")
-            self.assertIn("screenshot_path", units[0]["start"])
-            self.assertIn("screenshot_path", units[0]["end"])
-            self.assertTrue(units[0]["actions"])
-            self.assertEqual(units[-1]["type"], "keyframe_step")
-            self.assertEqual(units[-1]["verification"]["verdict"], "correct")
-            self.assertGreaterEqual(leaf.metadata["compression"]["compressed_progress_steps"], 1)
+            anchors = leaf.metadata["decision_anchors"]
+            self.assertLess(len(anchors), len(trajectory.steps))
+            self.assertTrue(all(anchor["type"] == "decision_anchor" for anchor in anchors))
+            self.assertTrue(all("action" in anchor and "before" in anchor and "verification" in anchor for anchor in anchors))
+            self.assertTrue(any(anchor["verification"]["verdict"] == "correct" for anchor in anchors))
+            self.assertGreaterEqual(leaf.metadata["plain_step_summary"]["omitted_step_count"], 1)
+            self.assertEqual(
+                leaf.metadata["compression"]["decision_anchor_count"],
+                len(anchors),
+            )
             self.assertTrue(any(eid.startswith("image:") for eid in leaf.evidence_ids))
             self.assertTrue(any(dst.startswith("image:") for dst in memory.edges[leaf.node_id]))
 
@@ -117,12 +117,13 @@ class SmokeTest(unittest.TestCase):
             memory = HierarchicalMemoryStore(Path(tmp) / "memory.json")
             nodes = memory.update_from_trajectory(trajectory)
             leaf = next(node for node in nodes if node.kind == "trajectory")
-            full_step = leaf.metadata["interleaved_units"][0]
-            self.assertEqual(full_step["type"], "full_step")
-            self.assertEqual(full_step["resolution"], "high")
-            self.assertEqual(full_step["verification"]["verdict"], "wrong")
-            self.assertIn("before", full_step)
-            self.assertIn("after", full_step)
+            failure_anchor = leaf.metadata["decision_anchors"][0]
+            self.assertEqual(failure_anchor["type"], "decision_anchor")
+            self.assertEqual(failure_anchor["resolution"], "full")
+            self.assertEqual(failure_anchor["verification"]["verdict"], "wrong")
+            self.assertIn("wrong_or_failed", failure_anchor["retention_reasons"])
+            self.assertIn("before", failure_anchor)
+            self.assertIn("after", failure_anchor)
             reflections = [node for node in nodes if node.kind == "failure-reflection"]
             self.assertEqual(len(reflections), 1)
             reflection = reflections[0]
