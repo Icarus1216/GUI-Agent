@@ -418,11 +418,24 @@ metadata. They are linked from the trajectory and pattern nodes, so a retrieved
 memory can be traced back to the exact visual state that supported it without
 embedding raw image bytes into the memory JSON.
 
+Memory updates are coordinated by `MemoryController`, while
+`HierarchicalMemoryStore` remains the graph persistence layer. The controller is
+responsible for post-update policy:
+
+- enhancing failure reflections with an optional small VLM/LLM reflection
+  client,
+- merging similar failure reflections into a reusable avoid/recover lesson,
+- actively forgetting low-value image evidence when the graph grows past the
+  configured node budget.
+
 `failure-reflection` nodes are created from failed trajectories or failed steps.
 They preserve the bad action, triggering screen state, environment feedback,
 avoid condition, recovery hint, and linked image evidence ids. This makes
 negative experience first-class memory: future episodes can retrieve not only
 what worked, but also what failed and the visual evidence behind that reflection.
+Without a reflection client, the controller uses deterministic rule-based
+reflection. With a small VLM client, the same node can be refined into a more
+compact summary, avoid condition, recovery hint, and confidence score.
 
 This is enough to run controlled studies on cross-episode experience transfer:
 

@@ -22,6 +22,7 @@ from vlm_memory_agent.eval import _safe_file_stem, write_report, EvalResult
 from vlm_memory_agent.llm.base import VLMClient, VLMResponse, parse_vlm_response_text
 from vlm_memory_agent.llm.openai_compatible import OpenAICompatibleVLMClient
 from vlm_memory_agent.llm.rule_based import RuleBasedVLMClient
+from vlm_memory_agent.memory.controller import MemoryController, MemoryControllerConfig
 from vlm_memory_agent.memory.store import HierarchicalMemoryStore
 from vlm_memory_agent.preflight import check_osworld, check_osworld_runtime
 from vlm_memory_agent.osworld_ready import collect_readiness
@@ -116,6 +117,67 @@ class SmokeTest(unittest.TestCase):
             context = memory.prompt_context([reflection])
             self.assertIn("Bad action:", context)
             self.assertIn("Recovery hint:", context)
+
+    def test_memory_controller_enhances_failure_reflection_with_small_vlm(self):
+        class FakeReflector:
+            def reflect(self, prompt: str) -> str:
+                self.last_prompt = prompt
+                return (
+                    '{"summary":"Do not finish from inbox.","avoid_when":"inbox visible and approval not submitted",'
+                    '"recovery_hint":"Open the email and complete the form first.",'
+                    '"failure_mode":"done was called before visible completion evidence","confidence":0.82}'
+                )
+
+        with TemporaryDirectory() as tmp:
+            env = LocalBrowserSalesEnv(screenshot_dir=Path(tmp) / "screens")
+            initial = env.reset("sales_approval")
+            failed = env.step(AgentAction("done", thought="incorrectly assume done"))
+            failed.status = StepStatus.FAILED
+            failed.feedback = "Cannot finish before the approval is submitted."
+            trajectory = Trajectory(task_id="sales_failure", task=initial.task)
+            trajectory.append(failed)
+
+            reflector = FakeReflector()
+            store = HierarchicalMemoryStore(Path(tmp) / "memory.json")
+            controller = MemoryController(store, reflection_client=reflector)
+            controller.update_from_trajectory(trajectory)
+            reflection = next(node for node in store.nodes.values() if node.kind == "failure-reflection")
+            self.assertEqual(reflection.summary, "Do not finish from inbox.")
+            self.assertEqual(reflection.metadata["avoid_when"], "inbox visible and approval not submitted")
+            self.assertEqual(reflection.action_hints, ["Open the email and complete the form first."])
+            self.assertTrue(reflection.metadata["reflection_enhanced"])
+            self.assertIn("Bad action", reflector.last_prompt)
+
+    def test_memory_controller_merges_similar_failure_reflections(self):
+        with TemporaryDirectory() as tmp:
+            store = HierarchicalMemoryStore(Path(tmp) / "memory.json")
+            controller = MemoryController(store)
+            for task_id in ("failure_a", "failure_b"):
+                env = LocalBrowserSalesEnv(screenshot_dir=Path(tmp) / task_id)
+                initial = env.reset("sales_approval")
+                failed = env.step(AgentAction("done", thought="incorrectly assume done"))
+                failed.status = StepStatus.FAILED
+                failed.feedback = "Cannot finish before the approval is submitted."
+                trajectory = Trajectory(task_id=task_id, task=initial.task)
+                trajectory.append(failed)
+                controller.update_from_trajectory(trajectory)
+
+            reflections = [node for node in store.nodes.values() if node.kind == "failure-reflection"]
+            self.assertEqual(len(reflections), 1)
+            self.assertGreaterEqual(reflections[0].metadata["merged_count"], 2)
+
+    def test_memory_controller_forgets_unreferenced_image_evidence_first(self):
+        with TemporaryDirectory() as tmp:
+            env = LocalBrowserSalesEnv(screenshot_dir=Path(tmp) / "screens")
+            trajectory = VLMGuiAgent(RuleBasedVLMClient(), HierarchicalMemoryStore(), config=None).run_episode(
+                env, task_id="sales_approval"
+            )
+            store = HierarchicalMemoryStore(Path(tmp) / "memory.json")
+            controller = MemoryController(store, config=MemoryControllerConfig(max_nodes=4))
+            controller.update_from_trajectory(trajectory)
+            self.assertLessEqual(len(store.nodes), 4)
+            self.assertTrue(any(node.kind == "state-action-pattern" for node in store.nodes.values()))
+            self.assertTrue(any(node.kind == "strategy" for node in store.nodes.values()))
 
     def test_agent_turns_invalid_vlm_json_into_fail_action(self):
         class BadJsonVLM(VLMClient):

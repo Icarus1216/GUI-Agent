@@ -1,5 +1,5 @@
-"""功能: 实现记忆增强 VLM GUI agent 的感知、检索、决策、执行和记忆更新主循环。
-上游依赖: 依赖 core 类型、InteractiveEnv、VLMClient、HierarchicalMemoryStore、ScreenParserTool 和 ActionParser。
+"""功能: 实现记忆增强 VLM GUI agent 的感知、检索、决策、执行和 memory controller 更新主循环。
+上游依赖: 依赖 core 类型、InteractiveEnv、VLMClient、HierarchicalMemoryStore/MemoryController、ScreenParserTool 和 ActionParser。
 下游依赖: CLI、API server、BenchmarkRunner、测试和真实 OSWorld 运行都通过 VLMGuiAgent 编排任务。
 """
 
@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from vlm_memory_agent.core.types import AgentAction, Observation, StepStatus, Trajectory
 from vlm_memory_agent.envs.base import InteractiveEnv
 from vlm_memory_agent.llm.base import VLMClient
+from vlm_memory_agent.memory.controller import MemoryController
 from vlm_memory_agent.memory.store import HierarchicalMemoryStore
 from vlm_memory_agent.tools.action_parser import ActionParser
 from vlm_memory_agent.tools.screen_parser import ScreenParserTool
@@ -41,12 +42,14 @@ class VLMGuiAgent:
         self,
         vlm: VLMClient,
         memory: HierarchicalMemoryStore,
+        memory_controller: MemoryController | None = None,
         screen_parser: ScreenParserTool | None = None,
         action_parser: ActionParser | None = None,
         config: AgentConfig | None = None,
     ) -> None:
         self.vlm = vlm
         self.memory = memory
+        self.memory_controller = memory_controller or MemoryController(memory)
         self.screen_parser = screen_parser or ScreenParserTool()
         self.action_parser = action_parser or ActionParser()
         self.config = config or AgentConfig()
@@ -80,7 +83,7 @@ class VLMGuiAgent:
             trajectory.append(result)
 
         if self.config.update_memory:
-            self.memory.update_from_trajectory(trajectory)
+            self.memory_controller.update_from_trajectory(trajectory)
         return trajectory
 
     def act(self, observation: Observation) -> AgentAction:
@@ -93,8 +96,8 @@ class VLMGuiAgent:
         """
 
         perception = self.screen_parser.parse(observation)
-        memory_nodes = self.memory.retrieve(f"{observation.task}\n{perception}", k=self.config.retrieve_k)
-        prompt = self._build_prompt(observation, perception, self.memory.prompt_context(memory_nodes))
+        memory_nodes = self.memory_controller.retrieve(f"{observation.task}\n{perception}", k=self.config.retrieve_k)
+        prompt = self._build_prompt(observation, perception, self.memory_controller.prompt_context(memory_nodes))
         try:
             response = self.vlm.decide(prompt, image_path=observation.screenshot_path)
             return self.action_parser.parse(response)
